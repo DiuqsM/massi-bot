@@ -87,8 +87,7 @@ CREATE TABLE IF NOT EXISTS content_catalog (
     b2_key              TEXT,                    -- Backblaze B2 object key
     media_type          TEXT DEFAULT 'mixed',    -- 'image', 'video', 'mixed'
     price_cents         INTEGER NOT NULL,        -- price in cents (e.g. 2738 = $27.38)
-    source              TEXT DEFAULT 'live'
-                        CHECK (source IN ('live', 'ai_generated')),
+    source              TEXT DEFAULT 'live' CHECK (source IN ('live', 'ai_generated')),
     created_at          TIMESTAMPTZ DEFAULT NOW(),
 
     CONSTRAINT uq_content UNIQUE (model_id, session_number, tier)
