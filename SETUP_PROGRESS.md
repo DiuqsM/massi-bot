@@ -29,12 +29,12 @@
 - [x] Telegram bot responding
 
 ## Model & Content
-- [ ] Model profile created in Supabase
-- [ ] Model ID saved to .env
-- [ ] Content folders created on platform
-- [ ] Content uploaded to platform
-- [ ] Content registered in catalog
-- [ ] /readiness check passing
+- [x] Model profile created in Supabase (id: 0650442e-2fd6-4bab-b149-27ec3fb18796)
+- [x] Model ID saved to .env (FANVUE_MODEL_ID)
+- [ ] Content folders created on platform (deferred — upload when content is ready)
+- [ ] Content uploaded to platform (deferred)
+- [ ] Content registered in catalog (deferred)
+- [ ] /readiness check passing (deferred — will pass once content is registered)
 
 ## Testing
 - [ ] Spare test account subscribed
@@ -42,5 +42,5 @@
 - [ ] Simulated PPV purchase verified
 
 ## Go Live
-- [ ] Engine unpaused (/resume)
-- [ ] System is live
+- [x] Engine unpaused — /stats shows Engine: ✅ Active
+- [x] System is live
