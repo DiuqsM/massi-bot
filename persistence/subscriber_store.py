@@ -122,6 +122,10 @@ def _subscriber_to_row(
         "sent_captions": sub.sent_captions,
         "gfe_message_count": sub.gfe_message_count,
         "sext_consent_given": sub.sext_consent_given,
+        "horniness_score": sub.horniness_score,
+        "fan_name": sub.fan_name,
+        "fan_profile": sub.fan_profile,
+        "tags": sub.tags,
         "gfe_continuation_pending": sub.gfe_continuation_pending,
         "gfe_continuations_paid": sub.gfe_continuations_paid,
         "ppv_heads_up_count": sub.ppv_heads_up_count,
@@ -167,6 +171,55 @@ def _subscriber_to_row(
         "qualifying_data": qualifying_data,
         "last_message_at": _dt_to_iso(sub.last_message_date),
     }
+
+
+def _decay_horniness(score: int, last_bot_message_at: Optional[str], ppv_count: int) -> int:
+    """
+    Time-based horniness score decay applied at load time.
+
+    Arousal is a present-state signal — a fan who was at 8 during a sexting session
+    three days ago is not still at 8 when they message again. Decaying prevents the bot
+    from jumping straight to explicit/Grok mode on a cold return.
+
+    Floors: buyers (ppv_count > 0) floor at 3 to preserve relationship warmth.
+    Non-buyers floor at 0 — no prior investment, treat as fresh start.
+
+    The orchestrator's Opus scoring + keyword detector push the score back up
+    within 1-2 messages if the fan re-escalates naturally.
+    """
+    if score == 0:
+        return 0
+    if not last_bot_message_at:
+        return score  # No send history yet — leave as-is
+
+    try:
+        from datetime import timezone as _tz
+        last_at = datetime.fromisoformat(last_bot_message_at.replace("Z", "+00:00"))
+        now = datetime.now(_tz.utc) if last_at.tzinfo else datetime.now()
+        gap_hours = (now - last_at).total_seconds() / 3600
+    except Exception:
+        return score
+
+    floor = 3 if ppv_count > 0 else 0
+
+    if gap_hours < 1:
+        decayed = score              # Same session — no decay
+    elif gap_hours < 4:
+        decayed = score - 2          # Slight cooldown
+    elif gap_hours < 24:
+        decayed = round(score * 0.5) # Half-day gap — significant drop
+    elif gap_hours < 72:
+        decayed = round(score * 0.3) # Multi-day gap
+    else:
+        decayed = round(score * 0.2) # 3+ days — near-reset
+
+    result = max(floor, decayed)
+    if result != score:
+        logger.debug(
+            "Horniness decay: %d → %d (gap=%.1fh ppv_count=%d)",
+            score, result, gap_hours, ppv_count,
+        )
+    return result
 
 
 def _row_to_subscriber(row: Dict[str, Any]) -> Subscriber:
@@ -258,6 +311,14 @@ def _row_to_subscriber(row: Dict[str, Any]) -> Subscriber:
         sent_captions=qd.get("sent_captions") or [],
         gfe_message_count=qd.get("gfe_message_count", 0),
         sext_consent_given=qd.get("sext_consent_given", False),
+        fan_name=qd.get("fan_name", ""),
+        fan_profile=qd.get("fan_profile") or {"personality": "", "interests": [], "kinks": [], "notes": ""},
+        horniness_score=_decay_horniness(
+            score=max(8, qd.get("horniness_score", 0)) if qd.get("sext_consent_given", False) else qd.get("horniness_score", 0),
+            last_bot_message_at=qd.get("last_successful_bot_message_at"),
+            ppv_count=sh.get("ppv_count", 0),
+        ),
+        tags=qd.get("tags") or [],
         gfe_continuation_pending=qd.get("gfe_continuation_pending", False),
         gfe_continuations_paid=qd.get("gfe_continuations_paid", 0),
         ppv_heads_up_count=qd.get("ppv_heads_up_count", 0),

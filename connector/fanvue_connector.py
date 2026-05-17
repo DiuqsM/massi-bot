@@ -114,6 +114,12 @@ _processed_message_uuids: Dict[str, bool] = {}  # messageUuid → True (dedup, m
 # Adaptive settle window — wait for fan to stop typing before starting pipeline
 _sub_last_msg_time: Dict[str, float] = {}
 
+# Recovery mode: when the server restarts after an outage, messages older than this
+# threshold get a recovery context so the agent acknowledges the gap naturally.
+_recovery_contexts: Dict[str, dict] = {}   # fan_uuid → {bot_gap_str, msg_count}
+_recovery_alert_sent: bool = False          # Telegram alert fires only once per startup
+_RECOVERY_THRESHOLD_MINUTES: int = 15
+
 
 def _settle_initial_seconds() -> float:
     try:
@@ -401,6 +407,8 @@ async def startup():
     # Poll GET /chats every 30s and inject any unread fan messages that didn't arrive via webhook.
     async def _inbox_poll_loop():
         import time as _time
+        from datetime import timezone as _tz
+        global _recovery_alert_sent
         await asyncio.sleep(10)  # brief startup delay
         while True:
             try:
@@ -412,6 +420,9 @@ async def startup():
                     if ctx.model_id not in seen_model_ids:
                         seen_model_ids.add(ctx.model_id)
                         unique_entries.append((creator_uuid, ctx))
+
+                stale_fans_this_cycle: list[tuple[str, str, int]] = []  # (fan_uuid, gap_str, msg_count)
+
                 for creator_uuid, ctx in unique_entries:
                     try:
                         headers = await _get_headers(creator_uuid)
@@ -444,6 +455,30 @@ async def startup():
                             # Skip if currently processing this fan
                             if _get_sub_lock(fan_uuid).locked():
                                 continue
+
+                            # Detect stale messages: if the fan's message is older than the
+                            # recovery threshold, the server was likely down. Store recovery
+                            # context so the agent can acknowledge the gap naturally.
+                            sent_at_str = last_msg.get("sentAt", "")
+                            if sent_at_str:
+                                try:
+                                    sent_at = datetime.fromisoformat(sent_at_str.replace("Z", "+00:00"))
+                                    age_min = (datetime.now(_tz.utc) - sent_at).total_seconds() / 60
+                                    if age_min >= _RECOVERY_THRESHOLD_MINUTES:
+                                        gap_hrs = age_min / 60
+                                        bot_gap_str = (
+                                            f"~{gap_hrs:.0f} hour{'s' if gap_hrs >= 2 else ''}"
+                                            if gap_hrs >= 1 else f"~{age_min:.0f} min"
+                                        )
+                                        msg_count = chat.get("unreadMessagesCount", 1) or 1
+                                        _recovery_contexts[fan_uuid] = {
+                                            "bot_gap_str": bot_gap_str,
+                                            "msg_count": msg_count,
+                                        }
+                                        stale_fans_this_cycle.append((fan_uuid, bot_gap_str, msg_count))
+                                except Exception:
+                                    pass
+
                             # Inject as a signed internal webhook
                             payload_dict = {
                                 "recipientUuid": creator_uuid,
@@ -459,7 +494,12 @@ async def startup():
                             signed_str = f"{ts_str}.{body_bytes.decode()}"
                             secret = os.environ.get("FANVUE_WEBHOOK_SECRET", "")
                             sig = hmac.new(secret.encode(), signed_str.encode(), hashlib.sha256).hexdigest()
-                            logger.info("Inbox poll: injecting unread message from fan %s", fan_uuid[:8])
+                            is_stale = fan_uuid in _recovery_contexts
+                            logger.info(
+                                "Inbox poll: injecting %smessage from fan %s",
+                                "STALE " if is_stale else "",
+                                fan_uuid[:8],
+                            )
                             async with httpx.AsyncClient(timeout=10) as client:
                                 await client.post(
                                     "http://localhost:8000/webhook/fanvue/",
@@ -469,8 +509,30 @@ async def startup():
                                         "X-Fanvue-Signature": f"t={ts_str},v0={sig}",
                                     },
                                 )
+                            # Stagger recovery replies so all fans don't get hit simultaneously
+                            if is_stale:
+                                await asyncio.sleep(3)
+
                     except Exception as e:
                         logger.warning("Inbox poll error for creator %s: %s", creator_uuid[:8], e)
+
+                # Fire one Telegram alert if this cycle found stale fans (server came back up)
+                if stale_fans_this_cycle and not _recovery_alert_sent:
+                    _recovery_alert_sent = True
+                    n = len(stale_fans_this_cycle)
+                    max_gap = max(g for _, g, _ in stale_fans_this_cycle)
+                    total_msgs = sum(c for _, _, c in stale_fans_this_cycle)
+                    try:
+                        from admin_bot.alerts import _send
+                        asyncio.create_task(_send(
+                            f"🔁 <b>Server Recovery</b>\n"
+                            f"Back online after {max_gap} of downtime.\n"
+                            f"{n} fan(s) had {total_msgs} message(s) pending.\n"
+                            f"Responding now in recovery mode (PPV suppressed on first reply)."
+                        ))
+                    except Exception:
+                        pass
+
             except Exception as e:
                 logger.warning("Inbox poll loop error: %s", e)
             await asyncio.sleep(30)
@@ -846,6 +908,105 @@ async def resolve_media_url(
 # Action executor (honors delay_seconds)
 # ─────────────────────────────────────────────
 
+def _split_into_chunks(text: str) -> list[str]:
+    """
+    Split a message into natural thought-chunks for sequential sending.
+    Splits at sentence boundaries, ellipses, and newlines.
+    Merges only true orphans (stray single punctuation chars, < 3 chars).
+    Never makes an LLM call.
+    """
+    import re
+
+    # Split at: ellipsis, sentence-ending punctuation before whitespace, or newline.
+    # Capturing group keeps the separator in the list so we can reattach it.
+    raw = re.split(r'(\.\.\.|[.!?]+(?=\s)|\n)', text)
+
+    chunks: list[str] = []
+    buf = ""
+    for part in raw:
+        if part == "\n":
+            # Newline = hard boundary — flush buf as its own chunk
+            if buf.strip():
+                chunks.append(buf.strip())
+            buf = ""
+        elif re.fullmatch(r'\.\.\.|[.!?]+', part):
+            # Punctuation/ellipsis — attach to current sentence, then flush
+            buf += part
+            if buf.strip():
+                chunks.append(buf.strip())
+            buf = ""
+        else:
+            # Normal text — just accumulate
+            buf += part
+    if buf.strip():
+        chunks.append(buf.strip())
+
+    # Merge only genuine orphans: stray punctuation or single chars (< 3 chars)
+    # that result from regex edge cases. "hey", "oh wow!" etc. are NOT orphans.
+    merged: list[str] = []
+    for chunk in chunks:
+        if merged and len(chunk.strip()) < 3:
+            merged[-1] = (merged[-1] + " " + chunk).strip()
+        else:
+            merged.append(chunk)
+
+    return [c for c in merged if c.strip()]
+
+
+async def _background_profile_extract(
+    platform_user_id: str,
+    model_id: str,
+    recent_messages: list,
+) -> None:
+    """
+    Background Haiku pass: extract fan personality/interests/kinks from recent conversation.
+    Waits 3s for the main handler to finish saving, then load-merge-save.
+    """
+    await asyncio.sleep(3)
+    try:
+        from llm.fan_profiler import extract_fan_profile
+        update = await extract_fan_profile(recent_messages)
+        if not update:
+            return
+
+        sub = load_subscriber(PLATFORM, platform_user_id, model_id)
+        if not sub:
+            return
+
+        fp = sub.fan_profile or {"personality": "", "interests": [], "kinks": [], "notes": ""}
+
+        changed = False
+        if update.get("personality") and update["personality"] != fp.get("personality", ""):
+            fp["personality"] = update["personality"]
+            changed = True
+        if update.get("notes") and update["notes"] != fp.get("notes", ""):
+            fp["notes"] = update["notes"]
+            changed = True
+        for list_field in ("interests", "kinks"):
+            new_items = update.get(list_field) or []
+            existing = fp.get(list_field) or []
+            existing_lower = {i.lower() for i in existing}
+            for item in new_items:
+                if item and item.lower() not in existing_lower:
+                    existing.append(item)
+                    existing_lower.add(item.lower())
+                    changed = True
+            fp[list_field] = existing
+
+        if not changed:
+            return
+
+        sub.fan_profile = fp
+        save_subscriber(sub, PLATFORM, platform_user_id, model_id)
+        logger.info(
+            "Background profile saved for %s: personality=%r interests=%s kinks=%s",
+            platform_user_id[:8], fp.get("personality", "")[:40],
+            fp.get("interests"), fp.get("kinks"),
+        )
+    except Exception as e:
+        logger.debug("Background profile extraction error: %s", e)
+
+
 async def execute_actions(
     actions: list[BotAction],
     platform_user_id: str,
@@ -895,7 +1056,14 @@ async def execute_actions(
             await asyncio.sleep(action.delay_seconds)
 
         if action.action_type == "send_message" and action.message:
-            await send_fanvue_message(creator_uuid, platform_user_id, action.message)
+            chunks = _split_into_chunks(action.message)
+            if len(chunks) <= 1:
+                await send_fanvue_message(creator_uuid, platform_user_id, action.message)
+            else:
+                for i, chunk in enumerate(chunks):
+                    await send_fanvue_message(creator_uuid, platform_user_id, chunk)
+                    if i < len(chunks) - 1:
+                        await asyncio.sleep(random.uniform(1.2, 2.5))
             _mark_sent()
 
         elif action.action_type == "send_ppv":
@@ -1188,6 +1356,42 @@ def _get_or_load_subscriber(
         )
         sub._platform = PLATFORM
         return sub, True
+
+    # Detect handle/display name change and update both in-memory and Supabase
+    changed: dict = {}
+    if username and username != sub.username:
+        logger.info(
+            "Fan %s changed handle: %r → %r",
+            platform_user_id[:8], sub.username, username,
+        )
+        changed["username"] = username
+        sub.username = username
+        try:
+            from admin_bot.alerts import _send
+            import asyncio
+            asyncio.create_task(_send(
+                f"✏️ <b>Fan changed handle</b>\n"
+                f"Old: <code>{sub.username}</code>\n"
+                f"New: <code>{username}</code>\n"
+                f"Display: {display_name or '(unchanged)'}"
+            ))
+        except Exception:
+            pass
+    if display_name and display_name != sub.display_name:
+        logger.info(
+            "Fan %s changed display name: %r → %r",
+            platform_user_id[:8], sub.display_name, display_name,
+        )
+        changed["display_name"] = display_name
+        sub.display_name = display_name
+
+    if changed:
+        try:
+            db = get_supabase()
+            db.table("subscribers").update(changed).eq("platform", PLATFORM).eq("platform_user_id", platform_user_id).eq("model_id", model_id).execute()
+        except Exception as e:
+            logger.warning("Failed to persist profile update for %s: %s", platform_user_id[:8], e)
+
     sub._platform = PLATFORM
     return sub, False
 
@@ -1283,7 +1487,7 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
     message_obj = payload.get("message") or {}
     platform_user_id: str = sender.get("uuid", "") or payload.get("senderUuid", "")
     message_text: str = (message_obj.get("text", "") or payload.get("text", "")).strip()
-    username: str = sender.get("username", "")
+    username: str = sender.get("handle", "") or sender.get("username", "")
     display_name: str = sender.get("displayName", username)
 
     # MULTI-MODEL: resolve model context from recipientUuid
@@ -1330,6 +1534,10 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
         # Record message arrival time for adaptive settle window tracking
         import time as _time
         _sub_last_msg_time[platform_user_id] = _time.monotonic()
+
+        # Pop recovery context if the inbox poll flagged this fan as stale.
+        # Only the FIRST orchestrator call gets it — regen/post-send passes are normal.
+        recovery_ctx = _recovery_contexts.pop(platform_user_id, None)
 
         lock = _get_sub_lock(platform_user_id)
 
@@ -1379,7 +1587,7 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
                     avatar = get_avatar(_avatars, sub.persona_id)
 
                     if message_text:
-                        actions = await orchestrator_process_message(sub, message_text, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
+                        actions = await orchestrator_process_message(sub, message_text, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count, recovery_context=recovery_ctx)
                     elif media_analysis:
                         # Media-only first message -- react to media
                         actions = await _media_react(sub, avatar, media_analysis, "", model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
@@ -1400,11 +1608,11 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
 
                     if combined_text and media_analysis:
                         # Text + media: process text through orchestrator, then append media reaction
-                        actions = await orchestrator_process_message(sub, combined_text, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
+                        actions = await orchestrator_process_message(sub, combined_text, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count, recovery_context=recovery_ctx)
                         media_actions = await _media_react(sub, avatar, media_analysis, combined_text, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
                         actions.extend(media_actions)
                     elif combined_text:
-                        actions = await orchestrator_process_message(sub, combined_text, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
+                        actions = await orchestrator_process_message(sub, combined_text, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count, recovery_context=recovery_ctx)
                     elif media_analysis:
                         # Media-only (no text) -- react via Media Reactor
                         actions = await _media_react(sub, avatar, media_analysis, "", model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
@@ -1452,6 +1660,13 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
 
                 logger.info(">>> Got %d actions from orchestrator", len(actions) if actions else 0)
                 save_subscriber(sub, PLATFORM, platform_user_id, model_id)
+
+                # Background profile extraction every 10 fan messages
+                if sub.message_count % 10 == 0 and len(sub.recent_messages or []) >= 5:
+                    asyncio.create_task(_background_profile_extract(
+                        platform_user_id, model_id, list(sub.recent_messages),
+                    ))
+
                 await execute_actions(actions, platform_user_id, model_id, sub, creator_uuid=creator_uuid)
 
                 # After executing (with delays), check for EVEN MORE messages.

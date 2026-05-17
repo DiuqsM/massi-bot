@@ -305,6 +305,74 @@ def _build_system_prompt(
     recovery = context.get("recovery_excuse", False)
     recovery_ctx = context.get("recovery_context") or {}
 
+    # Fan profile
+    fp = getattr(sub, "fan_profile", {}) or {}
+    fp_personality = (fp.get("personality") or "").strip()
+    fp_interests = [i for i in (fp.get("interests") or []) if i]
+    fp_kinks = [k for k in (fp.get("kinks") or []) if k]
+    fp_notes = (fp.get("notes") or "").strip()
+    _fp_has_content = any([fp_personality, fp_interests, fp_kinks, fp_notes])
+    if _fp_has_content:
+        _fp_lines = ["# FAN PROFILE (what you've learned about him — use it)"]
+        if fp_personality:
+            _fp_lines.append(f"Personality: {fp_personality}")
+        if fp_interests:
+            _fp_lines.append(f"Interests: {', '.join(fp_interests)}")
+        if fp_kinks:
+            _fp_lines.append(f"Kinks / turn-ons: {', '.join(fp_kinks)}")
+        if fp_notes:
+            _fp_lines.append(f"Notes: {fp_notes}")
+        _fp_lines.append("\nHow to use this (mandatory):")
+        if fp_kinks:
+            _fp_lines.append(
+                f"- Kinks ({', '.join(fp_kinks)}): when horniness > 5, weave them into escalation naturally. "
+                f"Don't announce them — act on them. If he's into domination, give commands. "
+                f"If he's into feet, drop it into scene narration. Make him feel seen without being clinical about it."
+            )
+        if fp_interests:
+            _fp_lines.append(
+                f"- Interests ({', '.join(fp_interests)}): during rapport, re-engagement, or post-nut cooldown, "
+                f"reference one naturally to feel personal ('btw how was the game'). "
+                f"It signals you remember him specifically — that's the GFE magic."
+            )
+        if fp_personality:
+            _fp_lines.append(
+                f"- Personality ({fp_personality}): calibrate your pacing and pressure. "
+                f"Shy/reserved → give him space, let him come to you, don't overwhelm. "
+                f"Bold/direct → match his energy, push harder, don't softpedal."
+            )
+        if fp_notes:
+            _fp_lines.append(
+                f"- Notes ({fp_notes}): use situational context. "
+                f"Works nights → he's likely alone right now, lean in. "
+                f"Single → emotionally available, GFE resonates harder."
+            )
+        fan_profile_block = "\n" + "\n".join(_fp_lines)
+    else:
+        fan_profile_block = (
+            "\n# FAN PROFILE\n"
+            "Nothing known yet. Pick up personality cues, interests, and kinks from the conversation "
+            "and include fan_profile_update in your output when you learn something worth remembering."
+        )
+
+    # Fan name
+    fan_name = getattr(sub, "fan_name", "").strip()
+    if fan_name:
+        fan_name_block = (
+            f"\n# FAN NAME\n"
+            f"He told you his name is: {fan_name}\n"
+            f"Use it naturally — say it during escalation moments, when teasing, or when it adds heat. "
+            f"Don't say it every message. Silence is sometimes more powerful than using his name."
+        )
+    else:
+        fan_name_block = (
+            f"\n# FAN NAME\n"
+            f"You don't know his name yet.\n"
+            f"Within the first 2-3 messages of a new rapport thread, find ONE natural moment to ask: "
+            f"\"wait what's your name?\" / \"what do I call you?\" — don't open with it, don't make it a form question. "
+            f"Once you learn it, set fan_name in your JSON output. Ask ONCE only — if he ignores it, drop it."
+        )
+
     open_threads_block = ""
     if open_threads:
         open_threads_block = "\nOpen conversational threads (he mentioned, you haven't followed up):\n" + "\n".join(f"  - {t}" for t in open_threads)
@@ -463,7 +531,7 @@ TIME GAP RESPONSE RULES (MANDATORY — match your energy to the ACTUAL gap):
   4 to 24 hours: Warm return. "missed you" energy is OK. Still no overdramatic "look who decided to show up."
   Over 24 hours: Full re-engagement energy. "look who's back" is appropriate here and ONLY here.
   CRITICAL: Read the actual gap value above. If it says "3 hours" do NOT respond as if it's been weeks. Calibrate precisely.
-{pending_ppv_block}{pending_custom_block}{recovery_block}
+{pending_ppv_block}{pending_custom_block}{recovery_block}{fan_profile_block}{fan_name_block}
 
 # RELATIONSHIP STATE
 {relationship_summary or "(first interaction)"}
@@ -594,13 +662,49 @@ she CAN do instead. Never just say no and leave it.
   "messages": [
     {{"text": "your message", "delay_seconds": 8}}
   ],
+  "horniness_score": 3,
   "consent_given": false,
-  "ppv": null
+  "ppv": null,
+  "fan_name": null,
+  "fan_profile_update": null
 }}
+
+# FAN NAME FIELD
+Set "fan_name" to his name/nickname ONLY in the same response where he first tells it to you.
+Leave it null in every other response — do not echo it back repeatedly.
+Extract exactly what he said: if he says "call me Jake" → "Jake". If he says "just call me daddy lol" → "daddy".
+
+# FAN PROFILE UPDATE FIELD
+Set "fan_profile_update" ONLY when you learn something new this turn. Leave it null otherwise.
+Include ONLY the fields that changed — partial updates are fine.
+  personality: one sentence about how he communicates or acts (overwrite the whole string)
+  interests:   LIST of new topics/hobbies you just learned — system APPENDS, don't repeat old ones
+  kinks:       LIST of new turn-ons/fetishes you just learned — system APPENDS, don't repeat old ones
+  notes:       anything else worth remembering (overwrite the whole string)
+
+Examples of what to capture:
+  He says "I'm really into feet" → kinks: ["feet"]
+  He says "I love sports, especially basketball" → interests: ["basketball"]
+  He's super verbose and emotional → personality: "very talkative, shares a lot about his feelings"
+  He mentions he works nights → notes: "works night shifts"
+  He says he likes being told what to do → kinks: ["being dominated", "JOI"]
+
+# HORNINESS SCORE — include in EVERY response, no exceptions.
+Rate how sexually aroused/engaged this fan is RIGHT NOW based on the full conversation (0-10):
+  0-2  — casual, just chatting, no sexual energy
+  3-4  — flirty, interested, warming up
+  5    — clearly interested in something more, light sexual energy
+  6-7  — sexually engaged, using sexual language, asking for content, responding to your teasing
+  8-9  — explicitly horny, very direct, urgently wants something explicit
+  10   — maximum arousal, completely focused on sexual content
+Score goes UP when: fan uses explicit language, asks to see you, responds enthusiastically to teasing, sends multiple messages in a row about sex.
+Score goes DOWN when: fan changes topic, goes cold, gives one-word replies, says no.
+Be honest — don't inflate. A fan saying "hey" is a 1. A fan saying "i'm so hard rn" is an 8.
 
 When dropping a tier PPV:
 {{
   "messages": [{{"text": "lead-in", "delay_seconds": 8}}],
+  "horniness_score": 7,
   "ppv": {{
     "tier": {next_tier},
     "caption": "vague teaser only",
@@ -612,6 +716,7 @@ When dropping a tier PPV:
 When dropping a CUSTOM payment PPV (after fan confirms they want to pay):
 {{
   "messages": [{{"text": "sending your payment unlock now", "delay_seconds": 8}}],
+  "horniness_score": 8,
   "ppv": {{
     "tier": "custom",
     "price": 177.38,
@@ -786,6 +891,16 @@ async def process_message(
         if "consent_declined" not in result:
             result["consent_declined"] = False
 
+        # Deduplicate consecutive identical messages — Opus occasionally outputs the
+        # same text twice when the fan's input is short or ambiguous.
+        deduped = []
+        for msg in result["messages"]:
+            if not deduped or msg.get("text", "").strip() != deduped[-1].get("text", "").strip():
+                deduped.append(msg)
+            else:
+                logger.warning("Dropped duplicate message: %s", msg.get("text", "")[:80])
+        result["messages"] = deduped
+
         # PPV hard guards (code-level, same as old pipeline)
         if result.get("ppv"):
             ppv_tier = result["ppv"].get("tier")
@@ -824,12 +939,15 @@ async def process_message(
         # Auto-uncensor: if the fan is in an explicit sexting state, pipe every
         # outbound message through Grok regardless of whether Opus called the tool.
         # Opus reliably judges its own output as "explicit enough" and skips the call.
-        sext_active = (
-            getattr(sub, "sext_consent_given", False)
-            or result.get("consent_given", False)
+        horniness = max(
+            getattr(sub, "horniness_score", 0),
+            result.get("horniness_score", 0),
         )
+        # Legacy compat: old sext_consent_given = True maps to score 8
+        if getattr(sub, "sext_consent_given", False) or result.get("consent_given", False):
+            horniness = max(horniness, 8)
         tiers_bought = sub.spending.ppv_count if sub.spending else 0
-        if sext_active and tiers_bought > 0:
+        if horniness > 5:
             try:
                 from agents.uncensor_agent import uncensor as _uncensor
                 uncensored_msgs = []
@@ -840,13 +958,14 @@ async def process_message(
                             text=text,
                             recommendation="build_tension",
                             tiers_purchased=tiers_bought,
+                            horniness_score=horniness,
                         )
                         if intensified and intensified.strip():
                             msg = dict(msg)
                             msg["text"] = intensified.strip()
                     uncensored_msgs.append(msg)
                 result["messages"] = uncensored_msgs
-                logger.info("Auto-uncensor applied (%d msgs, tier %d)", len(uncensored_msgs), tiers_bought)
+                logger.info("Auto-uncensor applied (%d msgs, horniness=%d, tier %d)", len(uncensored_msgs), horniness, tiers_bought)
             except Exception as e:
                 logger.warning("Auto-uncensor failed (non-fatal, using Opus output): %s", e)
 

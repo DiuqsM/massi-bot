@@ -37,3 +37,9 @@ node_modules/
 
 # Docker volumes
 redis_data/
+
+# Session chat logs
+docs/sessions/
+
+# AI session context (not for version control)
+AGENT.md

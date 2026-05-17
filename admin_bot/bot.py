@@ -366,6 +366,101 @@ async def cmd_set_uuid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"❌ Error: {exc}")
 
 
+async def cmd_fan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /fan @username  — show full profile for a specific fan
+    """
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /fan @username  or  /fan username", parse_mode="HTML")
+        return
+
+    username = args[0].lstrip("@").lower()
+    try:
+        model_id = _model_id()
+        db = get_client()
+        # Try username first, then display_name as fallback (Fanvue often stores blank username)
+        result = (
+            db.table("subscribers")
+            .select("*")
+            .eq("model_id", model_id)
+            .ilike("username", username)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            # Try matching display_name (e.g. "giant-unicorn-129" → "Giant Unicorn" won't match,
+            # but exact handle stored in display_name field might)
+            display_search = username.replace("-", " ")
+            result = (
+                db.table("subscribers")
+                .select("*")
+                .eq("model_id", model_id)
+                .ilike("display_name", f"%{display_search}%")
+                .limit(1)
+                .execute()
+            )
+            rows = result.data or []
+        if not rows:
+            await update.message.reply_text(f"No fan found: @{username}\nTip: try part of their display name, e.g. /fan giant")
+            return
+
+        r = rows[0]
+        qd = r.get("qualifying_data") or {}
+
+        horniness = qd.get("horniness_score", 0)
+        bar_filled = "🟥" * horniness + "⬜" * (10 - horniness)
+
+        whale = int(r.get("whale_score", 0))
+        whale_bar = "🐋" * min(whale // 20, 5)
+
+        tiers = qd.get("spending", {}).get("ppv_count", 0) if isinstance(qd.get("spending"), dict) else 0
+        total_spent = float(r.get("total_spent") or 0)
+        state = r.get("state", "?")
+        platform_id = r.get("platform_user_id", "?")
+        created = (r.get("created_at") or "")[:10]
+        sext_consent = qd.get("sext_consent_given", False)
+        pending_ppv = qd.get("pending_ppv")
+        pending_str = f"Tier {pending_ppv.get('tier')} (${pending_ppv.get('price', 0):.2f})" if pending_ppv else "none"
+
+        fan_name = qd.get("fan_name", "").strip()
+        fp = qd.get("fan_profile") or {}
+        fp_personality = (fp.get("personality") or "").strip()
+        fp_interests = [i for i in (fp.get("interests") or []) if i]
+        fp_kinks = [k for k in (fp.get("kinks") or []) if k]
+        fp_notes = (fp.get("notes") or "").strip()
+
+        lines = [
+            f"👤 <b>@{username}</b>",
+            f"Platform ID: <code>{str(platform_id)[:16]}</code>",
+            f"Joined: {created}",
+            f"",
+            f"🌡 <b>Horniness:</b> {horniness}/10",
+            f"{bar_filled}",
+            f"",
+            f"🐋 <b>Whale score:</b> {whale}/100 {whale_bar}",
+            f"💰 <b>Total spent:</b> ${total_spent:.2f}",
+            f"📦 <b>Tiers purchased:</b> {tiers}",
+            f"",
+            f"🔒 <b>State:</b> {state}",
+            f"✅ <b>Sext consent:</b> {'yes (legacy)' if sext_consent else 'via score'}",
+            f"📬 <b>Pending PPV:</b> {pending_str}",
+            f"",
+            f"🏷 <b>Tags:</b> {', '.join(qd.get('tags') or []) or '(none)'}",
+            f"",
+            f"📋 <b>Fan Profile</b>",
+            f"Name: {fan_name or '(unknown)'}",
+            f"Personality: {fp_personality or '(not yet observed)'}",
+            f"Interests: {', '.join(fp_interests) or '(none yet)'}",
+            f"Kinks: {', '.join(fp_kinks) or '(none yet)'}",
+            f"Notes: {fp_notes or '(none)'}",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Error: {exc}")
+
+
 # ─────────────────────────────────────────────
 # Bot setup + entry point
 # ─────────────────────────────────────────────
@@ -394,6 +489,7 @@ def build_application() -> Application:
         ("override", cmd_override),
         ("set_uuid", cmd_set_uuid),
         ("register_of", cmd_register_of),
+        ("fan", cmd_fan),
     ]:
         app.add_handler(CommandHandler(cmd, handler, filters=admin_filter))
 

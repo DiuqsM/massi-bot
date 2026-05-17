@@ -279,7 +279,16 @@ class Subscriber:
 
     # GFE-first tracking
     gfe_message_count: int = 0              # Fan messages received during GFE_BUILDING phase
-    sext_consent_given: bool = False         # Has fan explicitly consented to intimate content
+    sext_consent_given: bool = False         # Legacy flag — kept for backwards compat; gate now uses horniness_score
+    horniness_score: int = 0                 # 0-10, updated every message by Opus. Grok kicks in at > 5.
+    fan_name: str = ""                       # Preferred name/nickname extracted by agent ("Jake", "daddy", etc.)
+    fan_profile: Dict[str, Any] = field(default_factory=lambda: {
+        "personality": "",   # how he communicates and behaves (e.g. "shy but bold when comfortable")
+        "interests": [],     # hobbies and topics he brings up
+        "kinks": [],         # what turns him on
+        "notes": "",         # anything else worth remembering
+    })
+    tags: List[str] = field(default_factory=list)  # Free-form admin labels e.g. ["vip", "shy", "price-sensitive"]
     gfe_continuation_pending: bool = False   # Waiting for $20 continuation payment
     gfe_continuations_paid: int = 0          # How many continuation fees they've paid
 

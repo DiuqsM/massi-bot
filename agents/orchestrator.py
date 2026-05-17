@@ -109,13 +109,82 @@ async def process_message(
         ppv_info = result.get("ppv")
         consent_given = result.get("consent_given", False)
 
+        # Don't pitch a PPV the moment the server comes back from an outage.
+        # The agent handles the comeback message; next fan message resumes normal selling.
+        if recovery_context and ppv_info:
+            logger.info("[%s] Recovery mode — suppressing PPV for sub %s", req_id, sub.sub_id[:8])
+            ppv_info = None
+
         if consent_given and not getattr(sub, "sext_consent_given", False):
             sub.sext_consent_given = True
             logger.info("[%s] Consent given by sub %s", req_id, sub.sub_id)
 
+        # Extract fan name if the agent just learned it
+        learned_name = (result.get("fan_name") or "").strip()
+        if learned_name and learned_name != getattr(sub, "fan_name", ""):
+            sub.fan_name = learned_name
+            logger.info("[%s] Fan name learned: %r for sub %s", req_id, learned_name, sub.sub_id[:8])
+
+        # Merge fan profile update — lists dedupe-append, strings overwrite
+        profile_update = result.get("fan_profile_update") or {}
+        if profile_update and isinstance(profile_update, dict):
+            if not hasattr(sub, "fan_profile") or not sub.fan_profile:
+                sub.fan_profile = {"personality": "", "interests": [], "kinks": [], "notes": ""}
+            fp = sub.fan_profile
+            if profile_update.get("personality"):
+                fp["personality"] = str(profile_update["personality"]).strip()
+            if profile_update.get("notes"):
+                fp["notes"] = str(profile_update["notes"]).strip()
+            for list_field in ("interests", "kinks"):
+                new_items = profile_update.get(list_field) or []
+                if isinstance(new_items, str):
+                    new_items = [new_items]
+                existing = fp.get(list_field) or []
+                existing_lower = {i.lower() for i in existing}
+                for item in new_items:
+                    item = str(item).strip()
+                    if item and item.lower() not in existing_lower:
+                        existing.append(item)
+                        existing_lower.add(item.lower())
+                fp[list_field] = existing
+            sub.fan_profile = fp
+            logger.info("[%s] Fan profile updated for sub %s: %s", req_id, sub.sub_id[:8],
+                        {k: v for k, v in profile_update.items() if v})
+
+        # Update horniness score — Opus base + code-level keyword boost
+        new_score = result.get("horniness_score")
+        opus_score = max(0, min(10, int(new_score))) if isinstance(new_score, (int, float)) else getattr(sub, "horniness_score", 0)
+
+        # Keyword detector: fan's actual words override Opus's conservative judgment
+        msg_lower = (message or "").lower()
+        keyword_boost = 0
+        _EXPLICIT_9 = {"cum", "cumming", "orgasm", "cock", "dick", "pussy", "clit", "ass", "tits", "naked", "nude", "fingering", "masturbat", "jerk", "stroke", "fuck", "fucking", "sex", "horny", "hard", "wet", "dripping", "moan"}
+        _EXPLICIT_6 = {"hot", "sexy", "turn me on", "turned on", "aroused", "naughty", "dirty", "kinky", "want you", "need you", "body", "touch", "feel you", "show me", "send me", "pic", "video", "content"}
+        _COOLDOWN = {"bye", "later", "gtg", "gotta go", "not now", "busy", "nvm", "nevermind", "stop", "no thanks"}
+
+        words = set(msg_lower.split())
+        if any(k in msg_lower for k in _EXPLICIT_9):
+            keyword_boost = 9
+        elif any(k in msg_lower for k in _EXPLICIT_6):
+            keyword_boost = 6
+        elif any(k in msg_lower for k in _COOLDOWN):
+            keyword_boost = -3  # fan cooling off
+
+        # Take whichever is higher between Opus and keyword detector, apply cooldown
+        if keyword_boost < 0:
+            final_score = max(0, opus_score + keyword_boost)
+        else:
+            final_score = max(opus_score, keyword_boost)
+
+        old_score = getattr(sub, "horniness_score", 0)
+        sub.horniness_score = final_score
+        if final_score != old_score:
+            logger.info("[%s] Horniness score: %d → %d (opus=%d keyword_boost=%d) for sub %s",
+                        req_id, old_score, final_score, opus_score, keyword_boost, sub.sub_id[:8])
+
         # ── Parallel guardrails (8 concurrent checks, Cresta pattern) ──
         tiers_purchased = sub.spending.ppv_count if sub.spending else 0
-        sext_consent = getattr(sub, "sext_consent_given", False)
+        sext_consent = getattr(sub, "sext_consent_given", False) or getattr(sub, "horniness_score", 0) > 5
         all_passed, reports = await run_all_guardrails(
             messages=messages_list,
             ppv_intent=ppv_info,

@@ -121,6 +121,7 @@ async def uncensor(
     text: str,
     recommendation: str,
     tiers_purchased: int = 0,
+    horniness_score: int = 0,
 ) -> str:
     """
     Make clean text explicit for selling states.
@@ -129,12 +130,13 @@ async def uncensor(
         text: Clean text from the Conversation Director.
         recommendation: The Sales Strategist's recommendation (determines if uncensoring applies).
         tiers_purchased: Number of tiers the fan has purchased (for tier boundary).
+        horniness_score: Fan's current horniness (0-10) — boosts effective tier at high scores.
 
     Returns:
         Explicit version of the text, or original text if uncensoring doesn't apply.
     """
-    # Skip uncensoring for non-selling states
-    if recommendation not in UNCENSOR_STATES:
+    # Skip uncensoring for non-selling states unless horniness overrides
+    if recommendation not in UNCENSOR_STATES and horniness_score <= 5:
         return text
 
     client = _get_client()
@@ -143,7 +145,15 @@ async def uncensor(
 
     start = time.monotonic()
     try:
-        tier_boundary = _TIER_UNCENSOR_BOUNDARIES.get(tiers_purchased, _TIER_UNCENSOR_BOUNDARIES[0])
+        # High horniness boosts the effective tier so Grok matches the fan's energy
+        effective_tier = tiers_purchased
+        if horniness_score >= 9:
+            effective_tier = max(effective_tier, 5)
+        elif horniness_score >= 7:
+            effective_tier = max(effective_tier, 3)
+        elif horniness_score >= 6:
+            effective_tier = max(effective_tier, 2)
+        tier_boundary = _TIER_UNCENSOR_BOUNDARIES.get(effective_tier, _TIER_UNCENSOR_BOUNDARIES[0])
         system = _UNCENSOR_SYSTEM.replace("{tier_boundary}", tier_boundary)
 
         completion = await client.chat.completions.create(
