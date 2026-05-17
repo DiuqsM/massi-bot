@@ -198,10 +198,13 @@ async def fetch_fan_messages_since_fanvue(
     """Fetch fan-sent messages from Fanvue chat since given timestamp."""
     if not creator_uuid or not sender_uuid:
         return []
-    # Resolve OAuth token via token_manager
+    # Resolve OAuth token via token_manager; fall back to any stored token if UUID mismatches
     try:
-        from connector import token_manager
-        token = await token_manager.get_access_token(creator_uuid)
+        from connector.token_manager import token_manager as _tm
+        try:
+            token = await _tm.get_access_token(creator_uuid)
+        except Exception:
+            token = await _tm.get_access_token("")
     except Exception as e:
         logger.warning("Fanvue token fetch failed: %s", e)
         return []

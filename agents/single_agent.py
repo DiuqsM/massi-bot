@@ -821,6 +821,35 @@ async def process_message(
         except Exception as e:
             logger.debug("HV append failed (non-fatal): %s", e)
 
+        # Auto-uncensor: if the fan is in an explicit sexting state, pipe every
+        # outbound message through Grok regardless of whether Opus called the tool.
+        # Opus reliably judges its own output as "explicit enough" and skips the call.
+        sext_active = (
+            getattr(sub, "sext_consent_given", False)
+            or result.get("consent_given", False)
+        )
+        tiers_bought = sub.spending.ppv_count if sub.spending else 0
+        if sext_active and tiers_bought > 0:
+            try:
+                from agents.uncensor_agent import uncensor as _uncensor
+                uncensored_msgs = []
+                for msg in (result.get("messages") or []):
+                    text = msg.get("text", "").strip()
+                    if text:
+                        intensified = await _uncensor(
+                            text=text,
+                            recommendation="build_tension",
+                            tiers_purchased=tiers_bought,
+                        )
+                        if intensified and intensified.strip():
+                            msg = dict(msg)
+                            msg["text"] = intensified.strip()
+                    uncensored_msgs.append(msg)
+                result["messages"] = uncensored_msgs
+                logger.info("Auto-uncensor applied (%d msgs, tier %d)", len(uncensored_msgs), tiers_bought)
+            except Exception as e:
+                logger.warning("Auto-uncensor failed (non-fatal, using Opus output): %s", e)
+
         logger.info(
             "Single agent (%dms, %d tool rounds): msgs=%d ppv=%s consent=%s",
             elapsed_ms, rounds,

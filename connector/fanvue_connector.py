@@ -234,16 +234,11 @@ def _get_model_context(payload: dict) -> ModelContext:
                     stage_name=ctx.stage_name,
                 )
                 _model_contexts[recipient_uuid] = ctx_copy
-                # Persist the mapping to Supabase
-                try:
-                    db = get_supabase()
-                    db.table("models").update(
-                        {"fanvue_creator_uuid": recipient_uuid}
-                    ).eq("id", ctx.model_id).execute()
-                    logger.info("Persisted creator UUID %s for model %s",
-                               recipient_uuid[:8], ctx.model_id[:8])
-                except Exception:
-                    pass
+                # Do NOT overwrite Supabase fanvue_creator_uuid here — that value is the
+                # source of truth set during setup. Auto-detecting from webhooks would
+                # oscillate between the manager UUID (test button) and model UUID (real messages).
+                logger.info("Mapped unknown recipientUuid %s to model %s (in-memory only)",
+                           recipient_uuid[:8], ctx.model_id[:8])
                 return ctx_copy
 
     raise HTTPException(404, f"Unknown model -- recipientUuid not mapped: {recipient_uuid[:16]}")
@@ -402,6 +397,87 @@ async def startup():
     except Exception as e:
         logger.warning("Recovery sweep failed to start: %s", e)
 
+    # Inbox polling fallback: Fanvue webhook delivery is unreliable.
+    # Poll GET /chats every 30s and inject any unread fan messages that didn't arrive via webhook.
+    async def _inbox_poll_loop():
+        import time as _time
+        await asyncio.sleep(10)  # brief startup delay
+        while True:
+            try:
+                # Deduplicate by model_id — _model_contexts accumulates UUID aliases over time
+                # (each unknown recipientUuid gets a new entry), so poll once per real model.
+                seen_model_ids: set[str] = set()
+                unique_entries: list[tuple[str, object]] = []
+                for creator_uuid, ctx in list(_model_contexts.items()):
+                    if ctx.model_id not in seen_model_ids:
+                        seen_model_ids.add(ctx.model_id)
+                        unique_entries.append((creator_uuid, ctx))
+                for creator_uuid, ctx in unique_entries:
+                    try:
+                        headers = await _get_headers(creator_uuid)
+                        async with httpx.AsyncClient(timeout=15) as client:
+                            resp = await client.get(
+                                f"{API_BASE}/chats",
+                                headers=headers,
+                                params={"size": 100},
+                            )
+                        if resp.status_code != 200:
+                            continue
+                        chats = resp.json().get("data") or []
+                        for chat in chats:
+                            last_msg = chat.get("lastMessage") or {}
+                            last_msg_uuid = last_msg.get("uuid", "")
+                            last_sender = last_msg.get("senderUuid", "")
+                            # Skip if last message was sent by the model (already replied)
+                            if last_sender == creator_uuid:
+                                continue
+                            # Skip if already processed
+                            if last_msg_uuid and last_msg_uuid in _processed_message_uuids:
+                                continue
+                            # Skip if no unread messages from the fan
+                            if chat.get("isRead", True) and not chat.get("unreadMessagesCount", 0):
+                                continue
+                            fan = chat.get("user") or {}
+                            fan_uuid = fan.get("uuid", "")
+                            if not fan_uuid:
+                                continue
+                            # Skip if currently processing this fan
+                            if _get_sub_lock(fan_uuid).locked():
+                                continue
+                            # Inject as a signed internal webhook
+                            payload_dict = {
+                                "recipientUuid": creator_uuid,
+                                "sender": {
+                                    "uuid": fan_uuid,
+                                    "handle": fan.get("handle", ""),
+                                    "displayName": fan.get("displayName", ""),
+                                },
+                                "timestamp": last_msg.get("sentAt", ""),
+                            }
+                            body_bytes = json.dumps(payload_dict).encode()
+                            ts_str = str(int(_time.time()))
+                            signed_str = f"{ts_str}.{body_bytes.decode()}"
+                            secret = os.environ.get("FANVUE_WEBHOOK_SECRET", "")
+                            sig = hmac.new(secret.encode(), signed_str.encode(), hashlib.sha256).hexdigest()
+                            logger.info("Inbox poll: injecting unread message from fan %s", fan_uuid[:8])
+                            async with httpx.AsyncClient(timeout=10) as client:
+                                await client.post(
+                                    "http://localhost:8000/webhook/fanvue/",
+                                    content=body_bytes,
+                                    headers={
+                                        "Content-Type": "application/json",
+                                        "X-Fanvue-Signature": f"t={ts_str},v0={sig}",
+                                    },
+                                )
+                    except Exception as e:
+                        logger.warning("Inbox poll error for creator %s: %s", creator_uuid[:8], e)
+            except Exception as e:
+                logger.warning("Inbox poll loop error: %s", e)
+            await asyncio.sleep(30)
+
+    asyncio.create_task(_inbox_poll_loop())
+    logger.info("Inbox polling loop started (30s interval)")
+
     logger.info("Fanvue connector started (%d models loaded, %d avatars)",
                 len(_model_contexts), len(_avatars))
 
@@ -421,6 +497,7 @@ def verify_signature(body: bytes, sig_header: str) -> None:
     Header format: "t=<unix_timestamp>,v0=<hex_signature>"
     """
     if not sig_header:
+        logger.warning("SIGNATURE FAIL: missing header")
         raise HTTPException(status_code=403, detail="Missing signature header")
 
     try:
@@ -428,13 +505,17 @@ def verify_signature(body: bytes, sig_header: str) -> None:
         timestamp_str = parts["t"]
         signature = parts["v0"]
     except (KeyError, ValueError):
+        logger.warning("SIGNATURE FAIL: malformed header=%s", sig_header[:100])
         raise HTTPException(status_code=403, detail="Malformed signature header")
 
     try:
         ts = int(timestamp_str)
     except ValueError:
+        logger.warning("SIGNATURE FAIL: invalid timestamp=%s", timestamp_str)
         raise HTTPException(status_code=403, detail="Invalid timestamp")
-    if abs(time.time() - ts) > SIGNATURE_MAX_AGE:
+    age = abs(time.time() - ts)
+    if age > SIGNATURE_MAX_AGE:
+        logger.warning("SIGNATURE FAIL: timestamp too old age=%.0fs header=%s", age, sig_header[:80])
         raise HTTPException(status_code=403, detail="Webhook timestamp too old")
 
     secret = os.environ["FANVUE_WEBHOOK_SECRET"]
@@ -446,6 +527,8 @@ def verify_signature(body: bytes, sig_header: str) -> None:
     ).hexdigest()
 
     if not hmac.compare_digest(signature, expected):
+        logger.warning("SIGNATURE FAIL: hmac mismatch. header=%s secret_prefix=%s body_prefix=%s",
+                       sig_header[:80], secret[:4], body[:50])
         raise HTTPException(status_code=403, detail="Invalid signature")
 
 
@@ -454,7 +537,11 @@ def verify_signature(body: bytes, sig_header: str) -> None:
 # ─────────────────────────────────────────────
 
 async def _get_headers(creator_uuid: str = "") -> dict:
-    token = await token_manager.get_access_token(creator_uuid)
+    try:
+        token = await token_manager.get_access_token(creator_uuid)
+    except Exception:
+        # Webhook recipientUuid may differ from OAuth JWT sub — fall back to any stored token
+        token = await token_manager.get_access_token("")
     return {
         "Authorization": f"Bearer {token}",
         "X-Fanvue-API-Version": API_VERSION,
@@ -478,13 +565,22 @@ async def send_fanvue_message(creator_uuid: str, user_uuid: str, text: str) -> N
                 logger.error("send_message failed %d: %s | text_sent=%s", resp.status_code, resp.text[:200], text[:200])
                 try:
                     from admin_bot.alerts import _send
-                    asyncio.create_task(_send(
-                        f"⚠️ <b>Fanvue Message Rejected</b>\n"
-                        f"User: <code>{user_uuid[:12]}</code>\n"
-                        f"Status: {resp.status_code}\n"
-                        f"Text: <i>{text[:150]}</i>\n"
-                        f"Error: {resp.text[:150]}"
-                    ))
+                    if resp.status_code == 429:
+                        retry_after = resp.headers.get("Retry-After", "unknown")
+                        asyncio.create_task(_send(
+                            f"🚦 <b>Fanvue Rate Limited (429)</b>\n"
+                            f"User: <code>{user_uuid[:12]}</code>\n"
+                            f"Retry-After: {retry_after}s\n\n"
+                            f"Too many messages sent too fast. Bot is being throttled."
+                        ))
+                    else:
+                        asyncio.create_task(_send(
+                            f"⚠️ <b>Fanvue Message Rejected</b>\n"
+                            f"User: <code>{user_uuid[:12]}</code>\n"
+                            f"Status: {resp.status_code}\n"
+                            f"Text: <i>{text[:150]}</i>\n"
+                            f"Error: {resp.text[:150]}"
+                        ))
                 except Exception:
                     pass
             else:
@@ -496,6 +592,17 @@ async def send_fanvue_message(creator_uuid: str, user_uuid: str, text: str) -> N
                 await asyncio.sleep(2)
                 continue
             logger.error("Fanvue send_message failed after retry: %s", e)
+            try:
+                from admin_bot.alerts import _send
+                asyncio.create_task(_send(
+                    f"⚠️ <b>Fanvue Message Dropped</b>\n"
+                    f"User: <code>{user_uuid[:12]}</code>\n"
+                    f"Reason: network/timeout after retry\n"
+                    f"Error: {str(e)[:200]}\n\n"
+                    f"Fan did not receive a reply."
+                ))
+            except Exception:
+                pass
             return
         except Exception as e:
             logger.error("Fanvue send_message unexpected error: %s", e)
@@ -539,6 +646,25 @@ async def send_fanvue_ppv(
             async with httpx.AsyncClient(timeout=40.0) as client:
                 resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code in (200, 201):
+                break
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After", "unknown")
+                logger.warning("Fanvue send_ppv rate limited 429 (attempt %d), Retry-After=%s", attempt + 1, retry_after)
+                try:
+                    from admin_bot.alerts import _send
+                    asyncio.create_task(_send(
+                        f"🚦 <b>Fanvue PPV Rate Limited (429)</b>\n"
+                        f"User: <code>{user_uuid[:12]}</code>\n"
+                        f"Price: {price_cents} cents\n"
+                        f"Retry-After: {retry_after}s\n\n"
+                        f"PPV delivery is being throttled."
+                    ))
+                except Exception:
+                    pass
+                if attempt < len(_PPV_RETRY_DELAYS):
+                    delay = _PPV_RETRY_DELAYS[attempt]
+                    await asyncio.sleep(delay)
+                    continue
                 break
             if resp.status_code >= 500 and attempt < len(_PPV_RETRY_DELAYS):
                 delay = _PPV_RETRY_DELAYS[attempt]
@@ -1070,6 +1196,57 @@ def _get_or_load_subscriber(
 # Webhook handlers
 # ─────────────────────────────────────────────
 
+@app.post("/webhook/fanvue/")
+@app.post("/webhook/fanvue")
+async def webhook_dispatcher(request: Request, background_tasks: BackgroundTasks):
+    """
+    Fanvue sends all events to a single registered URL with the event type in the payload body.
+    This dispatcher reads the event type and routes to the appropriate handler.
+    Starlette caches request.body() so sub-handlers can read it again safely.
+    """
+    body = await request.body()
+    verify_signature(body, request.headers.get("X-Fanvue-Signature", ""))
+    payload = json.loads(body)
+
+    event_type = (
+        payload.get("event") or
+        payload.get("type") or
+        payload.get("eventType") or
+        ""
+    ).lower().replace("_", "-")
+
+    # Infer from payload structure when event type field is absent
+    if not event_type:
+        if payload.get("buyerUuid") or payload.get("buyer"):
+            event_type = "purchase-received"
+        elif payload.get("tipperUuid"):
+            event_type = "tip-received"
+        elif payload.get("followerUuid"):
+            event_type = "new-follower"
+        elif payload.get("subscriberUuid") or (payload.get("subscriber") and "message" not in payload):
+            event_type = "new-subscriber"
+        else:
+            event_type = "message-received"
+
+    logger.info("Fanvue dispatcher: event=%s keys=%s", event_type, sorted(payload.keys()))
+
+    if event_type in ("message-received", "message.received"):
+        return await webhook_message_received(request, background_tasks)
+    elif event_type in ("new-subscriber", "subscriber.new", "subscription.new"):
+        return await webhook_new_subscriber(request, background_tasks)
+    elif event_type in ("purchase-received", "purchase.received", "ppv.purchased"):
+        return await webhook_purchase_received(request, background_tasks)
+    elif event_type in ("tip-received", "tip.received"):
+        return await webhook_tip_received(request, background_tasks)
+    elif event_type in ("message-read", "message.read"):
+        return await webhook_message_read(request)
+    elif event_type in ("new-follower", "follower.new"):
+        return await webhook_new_follower(request)
+    else:
+        logger.warning("Fanvue dispatcher: unknown event '%s' -- routing as message-received", event_type)
+        return await webhook_message_received(request, background_tasks)
+
+
 @app.post("/webhook/fanvue/message-received")
 async def webhook_message_received(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
@@ -1119,7 +1296,22 @@ async def webhook_message_received(request: Request, background_tasks: Backgroun
     # Media-only messages (no text) are valid -- process them if media handling is enabled
     media_uuids = message_obj.get("mediaUuids") or []
     if not message_text and not has_media:
-        return JSONResponse({"status": "ignored"})
+        # Fanvue webhooks are notification-only — fetch actual text from REST API
+        if platform_user_id:
+            try:
+                from connector.recovery import fetch_fan_messages_since_fanvue
+                fetched = await fetch_fan_messages_since_fanvue(
+                    creator_uuid, platform_user_id, since_iso=None, limit=5
+                )
+                if fetched:
+                    message_text = fetched[-1].get("text", "").strip()
+                    if message_text:
+                        logger.info("Fetched message text from API for %s: %s",
+                                    platform_user_id[:8], message_text[:80])
+            except Exception as e:
+                logger.warning("Failed to fetch message text from API: %s", e)
+        if not message_text:
+            return JSONResponse({"status": "ignored"})
 
     # Dedup: skip if we've already processed this exact message UUID
     msg_uuid = payload.get("messageUuid") or message_obj.get("uuid", "")
