@@ -1828,7 +1828,7 @@ async def webhook_purchase_received(request: Request, background_tasks: Backgrou
                     sub.gfe_continuations_paid += 1
                     sub.gfe_message_count = 0
                     import random as _rnd
-                    sub.continuation_threshold_jitter = _rnd.randint(25, 35)
+                    sub.continuation_threshold_jitter = _rnd.randint(40, 50)
                     logger.info(">>> GFE CONTINUATION PAID by %s ($%.2f) -- counter reset, next threshold=%s, continuations=%d",
                                 platform_user_id, amount_dollars, sub.continuation_threshold_jitter, sub.gfe_continuations_paid)
                     # Send a warm "welcome back" instead of normal purchase flow

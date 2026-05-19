@@ -1224,7 +1224,7 @@ async def test_simulate_purchase(request: Request, background_tasks: BackgroundT
                     sub.gfe_message_count = 0
                     # Re-randomize continuation threshold for next cycle
                     import random as _rnd
-                    sub.continuation_threshold_jitter = _rnd.randint(25, 35)
+                    sub.continuation_threshold_jitter = _rnd.randint(40, 50)
                     logger.info(">>> GFE CONTINUATION PAID (test) by %s — counter reset, next threshold=%s",
                                 fan_id, sub.continuation_threshold_jitter)
                     actions = [BotAction(

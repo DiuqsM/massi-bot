@@ -1,5 +1,9 @@
 # Massi-Bot — Claude Code Deployment Guide (Single-Agent)
 
+> **Before reading further:** Check if `SETUP_PROGRESS.md` exists in the project root.
+> - If it **doesn't exist** or still has unchecked items (`- [ ]`): follow this file top to bottom to complete setup.
+> - If it **exists and has no unchecked items**: stop here. Read `AGENT.md` instead — this file is a setup template and won't reflect changes made after initial deployment.
+
 ## Your Role
 
 You are the automated deployment assistant for Massi-Bot. When a user starts a session, walk them through complete setup of the chatbot system step by step. Be patient, clear, and assume they have zero technical experience. Explain every click, every field, every button.

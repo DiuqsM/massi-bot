@@ -82,10 +82,22 @@ async def process_message(
 
     sub.add_message("sub", message)
     sub.message_count += 1
+    sub.gfe_message_count += 1
 
     try:
         context = await build_context(sub, message, avatar, model_profile=model_profile)
         context["request_id"] = req_id
+
+        # Tell the agent the continuation gate is ready — it decides the timing.
+        tiers_bought = sub.spending.ppv_count if sub.spending else 0
+        threshold = sub.continuation_threshold_jitter or random.randint(40, 50)
+        if (
+            sub.gfe_message_count >= threshold
+            and not getattr(sub, "gfe_continuation_pending", False)
+            and tiers_bought == 0
+        ):
+            context["gfe_continuation_ready"] = True
+
         if recovery_context:
             # Fix 11: tell the agent it's coming back from silence so it can
             # respond naturally to fan messages sent during the outage.
@@ -227,8 +239,11 @@ async def process_message(
             prices = _tier_prices(model_profile)
             ppv_tier = ppv_info.get("tier")
             is_custom = str(ppv_tier).lower() == "custom"
+            is_continuation = str(ppv_tier).lower() == "continuation"
 
-            if is_custom:
+            if is_continuation:
+                pass  # handled in the GFE continuation block below
+            elif is_custom:
                 # Fix 13 Bug A: the tool-authoritative price lives on
                 # sub.pending_custom_order (written by classify_custom_request),
                 # not the agent's JSON echo. The agent has been known to anchor
@@ -256,7 +271,7 @@ async def process_message(
                     delay_seconds=random.randint(5, 15),
                     metadata={"tier": "custom", "source": "single_agent"},
                 ))
-            else:
+            elif not is_continuation:
                 tier_num = int(ppv_tier)
                 price = prices.get(tier_num, prices.get(1, 27.38))
                 caption = ppv_info.get("caption", "just for you 😈")
@@ -282,6 +297,24 @@ async def process_message(
                     metadata={"tier": f"tier_{tier_num}", "source": "single_agent"},
                 ))
                 sub.last_pitch_at = datetime.now()
+
+        # ── GFE continuation paywall — agent-triggered ──
+        # The agent decides timing; we just handle the output here.
+        if ppv_info and str(ppv_info.get("tier", "")).lower() == "continuation":
+            sub.gfe_continuation_pending = True
+            sub.continuation_threshold_jitter = random.randint(40, 50)
+            actions.append(BotAction(
+                action_type="send_ppv",
+                ppv_price=_GFE_CONTINUATION_PRICE,
+                ppv_caption="just for you",
+                message="",
+                delay_seconds=random.randint(5, 15),
+                metadata={"tier": "continuation", "source": "single_agent"},
+            ))
+            logger.info(
+                "GFE continuation paywall fired by agent for sub %s (msg %d)",
+                sub.sub_id[:8], sub.gfe_message_count,
+            )
 
         # ── Track bot messages + bandit record ──
         for action in actions:
@@ -339,7 +372,7 @@ async def process_purchase(
         sub.gfe_continuation_pending = False
         # Re-randomize the continuation threshold so the next cycle fires at
         # a different point (prevents deterministic "exactly 30 msgs" pattern).
-        sub.continuation_threshold_jitter = random.randint(25, 35)
+        sub.continuation_threshold_jitter = random.randint(40, 50)
 
     try:
         context = await build_context(sub, "paid", avatar, model_profile=model_profile)

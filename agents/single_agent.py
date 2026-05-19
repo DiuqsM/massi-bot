@@ -281,6 +281,7 @@ def _build_system_prompt(
     total_spent = sub.spending.total_spent if sub.spending else 0
     sext_consent = getattr(sub, "sext_consent_given", False)
     gfe_msgs = getattr(sub, "gfe_message_count", 0)
+    gfe_continuation_ready = context.get("gfe_continuation_ready", False)
     pending_ppv = getattr(sub, "pending_ppv", None)
     pending_custom = getattr(sub, "pending_custom_order", None)
     next_tier = min(ppv_count + 1, 6)
@@ -419,6 +420,19 @@ def _build_system_prompt(
         # Legacy crash-recovery path (kept for back-compat until old crash flag is removed).
         recovery_block = "\n!! YOU WENT SILENT — the fan saw you online but you didn't reply. Use judgment on whether to briefly acknowledge the gap."
 
+    continuation_block = ""
+    if gfe_continuation_ready:
+        continuation_block = (
+            "\n# GFE CONTINUATION GATE — READY TO SEND"
+            "\nThe fan has been chatting long enough that a $20 continuation unlock is available."
+            "\nYOU decide whether now is the right moment."
+            "\nGOOD timing: conversation is at a natural pause, he just responded warmly, nothing urgent is mid-air."
+            "\nBAD timing: he's mid-escalation sexually, he just vented something emotional, he seems about to leave, you just sent something that needs a reply."
+            "\nIf timing is good: include \"ppv\": {\"tier\": \"continuation\", \"caption\": \"just for you\"} in your output. No heads_up needed."
+            "\nIf timing is bad: skip it — you'll be offered this choice again next message."
+            "\nDo NOT mention money, paywalls, or unlocking to the fan. Just send it silently alongside your normal message."
+        )
+
     # Anti-repetition from HV registry — pull the most relevant categories
     hv_categories = []
     if sext_consent and ppv_count > 0:
@@ -531,7 +545,7 @@ TIME GAP RESPONSE RULES (MANDATORY — match your energy to the ACTUAL gap):
   4 to 24 hours: Warm return. "missed you" energy is OK. Still no overdramatic "look who decided to show up."
   Over 24 hours: Full re-engagement energy. "look who's back" is appropriate here and ONLY here.
   CRITICAL: Read the actual gap value above. If it says "3 hours" do NOT respond as if it's been weeks. Calibrate precisely.
-{pending_ppv_block}{pending_custom_block}{recovery_block}{fan_profile_block}{fan_name_block}
+{pending_ppv_block}{pending_custom_block}{recovery_block}{continuation_block}{fan_profile_block}{fan_name_block}
 
 # RELATIONSHIP STATE
 {relationship_summary or "(first interaction)"}
