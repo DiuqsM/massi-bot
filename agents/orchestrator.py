@@ -9,6 +9,8 @@ Public entry points (called by connectors):
   - process_message(sub, message, avatar, model_profile) -> list[BotAction]
   - process_purchase(sub, amount, avatar, content_type, model_profile) -> list[BotAction]
   - process_new_subscriber(sub, avatar, model_profile) -> list[BotAction]
+  - process_resub(sub, avatar, model_profile) -> list[BotAction]
+  - process_new_follower(sub, avatar, model_profile) -> list[BotAction]
 """
 
 import os
@@ -17,13 +19,15 @@ import random
 import logging
 import uuid
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'engine'))
 
 from models import Subscriber, SubState, BotAction
 from engine.bandit_recorder import record_bot_message_sent
 from engine.high_value_memory import HVCategory, append_utterance
+from engine.session_control import SessionController, classify_objection, BROKEY_COOLING_WARMTH
+import random as _random
 
 from agents.context_builder import build_context
 from agents.single_agent import process_message as single_agent_process
@@ -45,8 +49,8 @@ _DEFAULT_TIER_PRICES = {
 _GFE_CONTINUATION_PRICE = 20.00
 
 # Cobalt-Strike jitter for PPV realness (heads-up -> PPV drop).
-_PPV_JITTER_MIN_SECONDS = 108
-_PPV_JITTER_MAX_SECONDS = 252
+_PPV_JITTER_MIN_SECONDS = 10
+_PPV_JITTER_MAX_SECONDS = 15
 
 
 def _tier_prices(model_profile=None) -> dict:
@@ -84,9 +88,65 @@ async def process_message(
     sub.message_count += 1
     sub.gfe_message_count += 1
 
+    # ── Session lock: skip Opus entirely, return template response immediately ──
+    # Fan has completed all tiers and is in the cooldown window. No LLM needed —
+    # the answer is always "not tonight, come back tomorrow." Bypassing Opus saves
+    # ~15s latency and ~$0.015 per message, and guarantees no explicit content leak.
+    if getattr(sub, "session_locked_until", None) and sub.session_locked_until > datetime.now():
+        from llm.llm_router import _calculate_reply_delay
+        push = getattr(sub, "session_lock_push_count", 0)
+        sub.session_lock_push_count = push + 1
+        lock_response = SessionController.get_session_lock_response(sub, push_count=push)
+        sub.add_message("bot", lock_response)
+        logger.info(
+            "[%s] Session lock active (push #%d) — template response, no Opus call for sub %s",
+            req_id, push + 1, sub.sub_id[:8],
+        )
+        return [BotAction(
+            action_type="send_message",
+            message=lock_response,
+            delay_seconds=_calculate_reply_delay(lock_response),
+            metadata={"source": "session_lock_template", "push_count": push},
+        )]
+
     try:
+        # ── Objection detection: track state, inject directive into context ──
+        # Only active when a PPV is actually live (pending_ppv set) or was sent
+        # in the last 30 minutes (fan may reply "no" after the heads-up but before
+        # the PPV drop arrives). Never fires during normal post-consent chat.
+        _pending_ppv = getattr(sub, "pending_ppv", None)
+        _last_pitch = getattr(sub, "last_pitch_at", None)
+        _pitch_recent = (
+            _last_pitch is not None
+            and (datetime.now() - _last_pitch) < timedelta(minutes=30)
+        )
+        in_selling_mode = _pending_ppv is not None or _pitch_recent
+        objection_context: Optional[dict] = None
+        if in_selling_mode:
+            if SessionController.is_in_brokey_cooldown(sub):
+                # Fan hit 2 nos — warmth-only, no PPV drops
+                objection_context = {"brokey_cooldown": True}
+                logger.info("[%s] Brokey cooldown active for sub %s", req_id, sub.sub_id[:8])
+            else:
+                objection_type = classify_objection(message)
+                if objection_type:
+                    ppv_count = sub.spending.ppv_count if sub.spending else 0
+                    _, next_action = SessionController.handle_tier_objection(sub, avatar, objection_type)
+                    objection_context = {
+                        "objection_type": objection_type,
+                        "no_count": sub.tier_no_count,
+                        "is_brokey": next_action == "brokey",
+                        "has_purchased_before": ppv_count > 0,
+                    }
+                    logger.info("[%s] Objection %s no#%d brokey=%s for sub %s",
+                                req_id, objection_type, sub.tier_no_count,
+                                next_action == "brokey", sub.sub_id[:8])
+
         context = await build_context(sub, message, avatar, model_profile=model_profile)
         context["request_id"] = req_id
+
+        if objection_context:
+            context["objection_context"] = objection_context
 
         # Tell the agent the continuation gate is ready — it decides the timing.
         tiers_bought = sub.spending.ppv_count if sub.spending else 0
@@ -194,6 +254,26 @@ async def process_message(
             logger.info("[%s] Horniness score: %d → %d (opus=%d keyword_boost=%d) for sub %s",
                         req_id, old_score, final_score, opus_score, keyword_boost, sub.sub_id[:8])
 
+        # ── Mechanical consent detection ──
+        # Mirrors the horniness keyword boost pattern. If the fan's message contains an
+        # unambiguous proactive spend signal, grant consent in code regardless of what
+        # Opus put in its JSON output. All phrases are multi-word to avoid false positives.
+        _CONSENT_PHRASES = {
+            "open to spending", "willing to spend", "down to spend", "ready to spend",
+            "i'll pay", "ill pay", "i will pay", "i'd pay", "id pay",
+            "i'll buy", "ill buy", "i will buy", "i'd buy", "id buy",
+            "happy to pay", "happy to spend",
+            "don't mind spending", "dont mind spending",
+            "don't mind paying", "dont mind paying",
+            "ready to buy", "down to buy",
+        }
+        if not getattr(sub, "sext_consent_given", False):
+            if any(phrase in msg_lower for phrase in _CONSENT_PHRASES):
+                sub.sext_consent_given = True
+                consent_given = True
+                logger.info("[%s] Consent granted mechanically (keyword match) for sub %s",
+                            req_id, sub.sub_id[:8])
+
         # ── Parallel guardrails (8 concurrent checks, Cresta pattern) ──
         tiers_purchased = sub.spending.ppv_count if sub.spending else 0
         sext_consent = getattr(sub, "sext_consent_given", False) or getattr(sub, "horniness_score", 0) > 5
@@ -235,6 +315,20 @@ async def process_message(
             ))
 
         # ── PPV injection with heads-up + Cobalt jitter ──
+        # Hard block: never drop a new tier PPV while the session cooldown is active.
+        # The prompt already instructs the agent not to pitch, but Opus can still emit
+        # a ppv block — strip it mechanically so the lock is guaranteed.
+        _session_locked = bool(
+            getattr(sub, "session_locked_until", None)
+            and sub.session_locked_until > datetime.now()
+        )
+        if _session_locked and ppv_info and str(ppv_info.get("tier", "")).lower() not in ("continuation", "custom"):
+            logger.info(
+                "Session lock active until %s — discarding tier PPV for sub %s",
+                sub.session_locked_until.isoformat(), sub.sub_id[:8],
+            )
+            ppv_info = None
+
         if ppv_info and ppv_info.get("tier"):
             prices = _tier_prices(model_profile)
             ppv_tier = ppv_info.get("tier")
@@ -298,9 +392,14 @@ async def process_message(
                 ))
                 sub.last_pitch_at = datetime.now()
 
-        # ── GFE continuation paywall — agent-triggered ──
-        # The agent decides timing; we just handle the output here.
-        if ppv_info and str(ppv_info.get("tier", "")).lower() == "continuation":
+        # ── GFE continuation paywall ──
+        # Agent fires it if it recognises the moment; orchestrator forces it if the agent
+        # skips (Opus tends to self-exempt when the conversation feels emotionally warm).
+        _gfe_ready = context.get("gfe_continuation_ready", False)
+        _agent_fired_continuation = bool(
+            ppv_info and str(ppv_info.get("tier", "")).lower() == "continuation"
+        )
+        if _agent_fired_continuation or _gfe_ready:
             sub.gfe_continuation_pending = True
             sub.continuation_threshold_jitter = random.randint(40, 50)
             actions.append(BotAction(
@@ -312,14 +411,20 @@ async def process_message(
                 metadata={"tier": "continuation", "source": "single_agent"},
             ))
             logger.info(
-                "GFE continuation paywall fired by agent for sub %s (msg %d)",
+                "GFE continuation paywall fired (%s) for sub %s (msg %d)",
+                "agent" if _agent_fired_continuation else "mechanical",
                 sub.sub_id[:8], sub.gfe_message_count,
             )
 
         # ── Track bot messages + bandit record ──
+        fan_name_lower = (getattr(sub, "fan_name", "") or "").strip().lower()
         for action in actions:
             if action.message and action.action_type == "send_message":
                 sub.add_message("bot", action.message)
+                # Track when bot last said the fan's name so the prompt can enforce the 30-msg cooldown
+                if fan_name_lower and fan_name_lower in action.message.lower():
+                    sub.fan_name_last_used_at_msg = sub.message_count
+                    logger.debug("Fan name '%s' used at msg %d", fan_name_lower, sub.message_count)
                 try:
                     await record_bot_message_sent(sub, action.message)
                 except Exception:
@@ -382,6 +487,14 @@ async def process_purchase(
             if model_profile and getattr(model_profile, "active_tier_count", None):
                 tier_count = int(model_profile.active_tier_count)
 
+        tiers_bought_so_far = sub.spending.ppv_count if sub.spending else 0
+        context["event_hint"] = (
+            f"[PURCHASE CONFIRMED] The fan just unlocked a PPV — tier {tiers_bought_so_far}. "
+            f"React with genuine excitement (short, 1 sentence max). "
+            f"Then, if there are more tiers left, tease what's coming next — build anticipation. "
+            f"Do NOT mention money, prices, or 'tier'. Keep it natural and in-character."
+        )
+
         result = await single_agent_process(
             message="paid",
             avatar=avatar,
@@ -391,6 +504,8 @@ async def process_purchase(
         )
 
         actions: list[BotAction] = []
+        ppv_info = result.get("ppv")
+
         for msg in (result.get("messages") or []):
             text = (msg.get("text") or "").strip()
             if text:
@@ -400,6 +515,48 @@ async def process_purchase(
                     delay_seconds=msg.get("delay_seconds", random.randint(5, 12)),
                     metadata={"source": "single_agent", "context": "post_purchase"},
                 ))
+
+        # ── PPV injection: ALWAYS schedule next tier after a confirmed PPV purchase ──
+        # The agent's post-purchase reaction is the TEXT. The next tier drop is the
+        # orchestrator's job — it knows exactly what tier comes next from ppv_count.
+        # Agent's ppv output (if any) is used for caption/heads_up copy; if absent,
+        # we use defaults. The tier number is ALWAYS derived from ppv_count.
+        if content_type == "ppv":
+            tiers_bought = sub.spending.ppv_count if sub.spending else 0  # post-purchase count
+            tier_ceiling = tier_count or 6
+            if 0 < tiers_bought < tier_ceiling:
+                next_tier_num = tiers_bought + 1
+                prices = _tier_prices(model_profile)
+                price = prices.get(next_tier_num, prices.get(1, 27.38))
+
+                # Use agent's caption/heads_up if it provided them
+                agent_ppv = ppv_info or {}
+                caption = agent_ppv.get("caption") or "just for you 😈"
+                heads_up = agent_ppv.get("heads_up") or ""
+
+                if heads_up:
+                    actions.append(BotAction(
+                        action_type="send_message",
+                        message=heads_up,
+                        delay_seconds=random.randint(4, 9),
+                        metadata={"source": "single_agent", "ppv_heads_up": True},
+                    ))
+                    append_utterance(sub, HVCategory.PPV_HEADS_UP, heads_up)
+
+                ppv_delay = random.randint(_PPV_JITTER_MIN_SECONDS, _PPV_JITTER_MAX_SECONDS)
+                actions.append(BotAction(
+                    action_type="send_ppv",
+                    ppv_price=price,
+                    ppv_caption=caption,
+                    message="",
+                    delay_seconds=ppv_delay,
+                    metadata={"tier": f"tier_{next_tier_num}", "source": "purchase_auto_inject"},
+                ))
+                sub.last_pitch_at = datetime.now()
+                logger.info(
+                    "Post-purchase PPV drop: tier %d $%.2f (delay %ds) for sub %s",
+                    next_tier_num, price, ppv_delay, sub.sub_id[:8],
+                )
 
         for action in actions:
             if action.message:
@@ -459,4 +616,125 @@ async def process_new_subscriber(
             action_type="send_message",
             message="hey 😏 what caught your eye?",
             delay_seconds=random.randint(5, 12),
+        )]
+
+
+async def process_resub(
+    sub: Subscriber,
+    avatar=None,
+    model_profile=None,
+    active_tier_count: Optional[int] = None,
+) -> list[BotAction]:
+    """Welcome back a fan who lapsed and resubscribed."""
+    try:
+        context = await build_context(sub, "", avatar, model_profile=model_profile)
+        tier_count = active_tier_count
+        if tier_count is None:
+            tier_count = int(getattr(model_profile, "active_tier_count", 6) or 6)
+
+        ppv_count = sub.spending.ppv_count if sub.spending else 0
+        total_spent = sub.spending.total_spent if sub.spending else 0.0
+        history_note = (
+            f"He previously spent ${total_spent:.2f} across {ppv_count} PPV purchase(s)."
+            if ppv_count > 0 else "He hasn't purchased anything yet."
+        )
+        fan_name_note = f" His name is {sub.fan_name}." if sub.fan_name else ""
+
+        context["event_hint"] = (
+            f"[RESUB] This fan just resubscribed after their subscription lapsed.{fan_name_note} {history_note} "
+            f"Send a warm, genuine 'you came back' message — short, personal, in your voice. "
+            f"If you know something specific about him (from fan profile or memories), reference it naturally. "
+            f"Don't be dramatic. Don't mention money or content yet. Just welcome him back like you mean it."
+        )
+
+        result = await single_agent_process(
+            message="",
+            avatar=avatar,
+            sub=sub,
+            context=context,
+            active_tier_count=tier_count,
+        )
+
+        # Resub is rapport-only — never pitch content on the welcome-back message.
+        if result.get("ppv"):
+            logger.info("Resub flow: discarding PPV from agent result for sub %s", sub.sub_id[:8])
+            result["ppv"] = None
+
+        actions: list[BotAction] = []
+        for msg in (result.get("messages") or []):
+            text = (msg.get("text") or "").strip()
+            if text:
+                actions.append(BotAction(
+                    action_type="send_message",
+                    message=text,
+                    delay_seconds=msg.get("delay_seconds", random.randint(5, 12)),
+                    metadata={"source": "single_agent", "context": "resub"},
+                ))
+
+        sub.state = SubState.WELCOME_SENT
+        for action in actions:
+            if action.message:
+                sub.add_message("bot", action.message)
+        return actions
+
+    except Exception as exc:
+        logger.exception("Resub orchestrator error for sub %s: %s", sub.sub_id, exc)
+        return [BotAction(
+            action_type="send_message",
+            message="you came back 🥺 I missed you",
+            delay_seconds=random.randint(5, 12),
+        )]
+
+
+async def process_new_follower(
+    sub: Subscriber,
+    avatar=None,
+    model_profile=None,
+    active_tier_count: Optional[int] = None,
+) -> list[BotAction]:
+    """Nudge a new follower to subscribe — conversion opportunity."""
+    try:
+        context = await build_context(sub, "", avatar, model_profile=model_profile)
+        tier_count = active_tier_count
+        if tier_count is None:
+            tier_count = int(getattr(model_profile, "active_tier_count", 6) or 6)
+
+        context["event_hint"] = (
+            "[NEW FOLLOWER] This person just followed you but has NOT subscribed yet — they haven't paid. "
+            "Send one short, curious, flirty message that makes them want to subscribe. "
+            "Tease what's behind the paywall without saying 'subscribe' or 'paywall' directly. "
+            "Make it feel like a private moment, like you noticed them specifically. "
+            "One or two sentences max. No hard sell. Leave ppv null."
+        )
+
+        result = await single_agent_process(
+            message="",
+            avatar=avatar,
+            sub=sub,
+            context=context,
+            active_tier_count=tier_count,
+        )
+
+        actions: list[BotAction] = []
+        for msg in (result.get("messages") or []):
+            text = (msg.get("text") or "").strip()
+            if text:
+                actions.append(BotAction(
+                    action_type="send_message",
+                    message=text,
+                    delay_seconds=msg.get("delay_seconds", random.randint(8, 20)),
+                    metadata={"source": "single_agent", "context": "new_follower"},
+                ))
+
+        for action in actions:
+            if action.message:
+                sub.add_message("bot", action.message)
+        return actions
+
+    except Exception as exc:
+        logger.exception("New follower orchestrator error for sub %s: %s", sub.sub_id, exc)
+        return [BotAction(
+            action_type="send_message",
+            message="noticed you 👀 you should come closer...",
+            delay_seconds=random.randint(8, 20),
         )]

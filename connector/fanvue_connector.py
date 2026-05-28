@@ -48,6 +48,8 @@ from persistence.model_profile import load_model_profile
 from agents.orchestrator import process_message as orchestrator_process_message
 from agents.orchestrator import process_purchase as orchestrator_process_purchase
 from agents.orchestrator import process_new_subscriber as orchestrator_process_new_subscriber
+from agents.orchestrator import process_resub as orchestrator_process_resub
+from agents.orchestrator import process_new_follower as orchestrator_process_new_follower
 from admin_bot.alerts import alert_purchase, alert_whale_escalation
 from connector.media_handler import process_media, MediaAnalysis
 from agents.media_reactor import react_to_media
@@ -123,9 +125,9 @@ _RECOVERY_THRESHOLD_MINUTES: int = 15
 
 def _settle_initial_seconds() -> float:
     try:
-        return float(os.environ.get("MESSAGE_SETTLE_INITIAL_SECONDS", "8"))
+        return float(os.environ.get("MESSAGE_SETTLE_INITIAL_SECONDS", "4"))
     except ValueError:
-        return 8.0
+        return 4.0
 
 
 def _settle_extension_seconds() -> float:
@@ -430,7 +432,7 @@ async def startup():
                             resp = await client.get(
                                 f"{API_BASE}/chats",
                                 headers=headers,
-                                params={"size": 100},
+                                params={"size": 50},
                             )
                         if resp.status_code != 200:
                             continue
@@ -1063,7 +1065,10 @@ async def execute_actions(
                 for i, chunk in enumerate(chunks):
                     await send_fanvue_message(creator_uuid, platform_user_id, chunk)
                     if i < len(chunks) - 1:
-                        await asyncio.sleep(random.uniform(1.2, 2.5))
+                        next_len = len(chunks[i + 1])
+                        chars_per_sec = random.uniform(5.0, 8.0)
+                        typing_delay = max(1.5, min(next_len / chars_per_sec, 20.0))
+                        await asyncio.sleep(typing_delay)
             _mark_sent()
 
         elif action.action_type == "send_ppv":
@@ -1436,7 +1441,8 @@ async def webhook_dispatcher(request: Request, background_tasks: BackgroundTasks
 
     if event_type in ("message-received", "message.received"):
         return await webhook_message_received(request, background_tasks)
-    elif event_type in ("new-subscriber", "subscriber.new", "subscription.new"):
+    elif event_type in ("new-subscriber", "subscriber.new", "subscription.new",
+                        "subscription-renewed", "subscription.renewed", "subscriber.renewed"):
         return await webhook_new_subscriber(request, background_tasks)
     elif event_type in ("purchase-received", "purchase.received", "ppv.purchased"):
         return await webhook_purchase_received(request, background_tasks)
@@ -1445,7 +1451,7 @@ async def webhook_dispatcher(request: Request, background_tasks: BackgroundTasks
     elif event_type in ("message-read", "message.read"):
         return await webhook_message_read(request)
     elif event_type in ("new-follower", "follower.new"):
-        return await webhook_new_follower(request)
+        return await webhook_new_follower(request, background_tasks)
     else:
         logger.warning("Fanvue dispatcher: unknown event '%s' -- routing as message-received", event_type)
         return await webhook_message_received(request, background_tasks)
@@ -1754,37 +1760,76 @@ async def webhook_new_subscriber(request: Request, background_tasks: BackgroundT
     creator_uuid = ctx.creator_uuid
 
     async def handle():
-        try:
-            sub = create_subscriber(
-                PLATFORM, platform_user_id, model_id,
-                username=username, display_name=display_name,
-            )
-
-            # Run attribution before new-subscriber processing
-            if (tracking_tag or promo_code) and ctx.attribution:
-                result = ctx.attribution.detect(
-                    tracking_tag=tracking_tag, promo_code=promo_code
-                )
-                if result.detected:
-                    sub.source_ig_account = result.ig_handle or ""
-                    sub.persona_id = result.persona_id or ""
-                    sub.source_detected = True
-
-            avatar = get_avatar(_avatars, sub.persona_id)
-            actions = await orchestrator_process_new_subscriber(sub, avatar)
-            save_subscriber(sub, PLATFORM, platform_user_id, model_id)
-            await execute_actions(actions, platform_user_id, model_id, sub, creator_uuid=creator_uuid)
-
-        except Exception as exc:
-            logger.exception("Error handling new subscriber %s: %s", platform_user_id, exc)
+        lock = _get_sub_lock(platform_user_id)
+        async with lock:
             try:
-                from admin_bot.error_alerts import alert_bot_error
-                await alert_bot_error(
-                    "handle_new_subscriber", exc, platform=PLATFORM, model=model_id,
-                    extra_context={"user_uuid": platform_user_id},
-                )
-            except Exception:
-                pass
+                existing = load_subscriber(PLATFORM, platform_user_id, model_id)
+
+                if existing is not None and not existing.is_follower_only:
+                    # Returning subscriber — resubbed after lapsing
+                    sub = existing
+                    if username and username != sub.username:
+                        sub.username = username
+                    if display_name and display_name != sub.display_name:
+                        sub.display_name = display_name
+                    logger.info(">>> RESUB: %s (ppv_count=%d total=$%.2f)",
+                                platform_user_id[:8], sub.spending.ppv_count, sub.spending.total_spent)
+                    avatar = get_avatar(_avatars, sub.persona_id)
+                    actions = await orchestrator_process_resub(sub, avatar, model_profile=ctx.model_profile,
+                                                               active_tier_count=ctx.active_tier_count)
+                else:
+                    # Truly new subscriber (or upgrading from follower-only)
+                    if existing is not None and existing.is_follower_only:
+                        sub = existing
+                        sub.is_follower_only = False
+                        if username and username != sub.username:
+                            sub.username = username
+                        logger.info(">>> FOLLOWER CONVERTED to subscriber: %s", platform_user_id[:8])
+                    else:
+                        sub = create_subscriber(
+                            PLATFORM, platform_user_id, model_id,
+                            username=username, display_name=display_name,
+                        )
+
+                    # Run attribution
+                    if (tracking_tag or promo_code) and ctx.attribution:
+                        attr_result = ctx.attribution.detect(
+                            tracking_tag=tracking_tag, promo_code=promo_code
+                        )
+                        if attr_result.detected:
+                            sub.source_ig_account = attr_result.ig_handle or ""
+                            sub.persona_id = attr_result.persona_id or ""
+                            sub.source_detected = True
+
+                    avatar = get_avatar(_avatars, sub.persona_id)
+
+                    # Race condition guard: if message-received already ran (fan messaged
+                    # within the settle window before this handler fired), skip standalone
+                    # welcome — the agent already introduced itself in context of their message.
+                    if sub.message_count > 0:
+                        logger.info(">>> NEW-SUB skip opener: fan %s already messaged (count=%d)",
+                                    platform_user_id[:8], sub.message_count)
+                        save_subscriber(sub, PLATFORM, platform_user_id, model_id)
+                        return
+
+                    actions = await orchestrator_process_new_subscriber(
+                        sub, avatar, model_profile=ctx.model_profile,
+                        active_tier_count=ctx.active_tier_count,
+                    )
+
+                save_subscriber(sub, PLATFORM, platform_user_id, model_id)
+                await execute_actions(actions, platform_user_id, model_id, sub, creator_uuid=creator_uuid)
+
+            except Exception as exc:
+                logger.exception("Error handling new subscriber %s: %s", platform_user_id, exc)
+                try:
+                    from admin_bot.error_alerts import alert_bot_error
+                    await alert_bot_error(
+                        "handle_new_subscriber", exc, platform=PLATFORM, model=model_id,
+                        extra_context={"user_uuid": platform_user_id},
+                    )
+                except Exception:
+                    pass
 
     background_tasks.add_task(handle)
     return JSONResponse({"status": "ok"})
@@ -1968,11 +2013,19 @@ async def webhook_tip_received(request: Request, background_tasks: BackgroundTas
 
     async def handle():
         try:
-            sub, _ = _get_or_load_subscriber(platform_user_id, model_id)
+            sub, creator_uuid = _get_or_load_subscriber(platform_user_id, model_id)
             sub.record_purchase(amount_dollars, "tip")
             save_subscriber(sub, PLATFORM, platform_user_id, model_id)
             record_transaction(sub.sub_id, model_id, "tip", amount_dollars, PLATFORM)
             logger.info("Tip: %s sent $%.2f", platform_user_id, amount_dollars)
+
+            # React to the tip — agent generates a warm, personal thank-you
+            avatar = ctx.avatar
+            synthetic_msg = f"[TIP RECEIVED: ${amount_dollars:.2f}] Fan just sent you a tip. React naturally — warm, grateful, a little flirty. Don't mention the dollar amount or the word 'tip'. Make him feel like the gesture landed."
+            actions = await orchestrator_process_message(sub, synthetic_msg, avatar, model_profile=ctx.model_profile, active_tier_count=ctx.active_tier_count)
+            save_subscriber(sub, PLATFORM, platform_user_id, model_id)
+            if actions:
+                await execute_actions(actions, platform_user_id, model_id, sub, creator_uuid=creator_uuid)
         except Exception as exc:
             logger.exception("Error handling tip from %s: %s", platform_user_id, exc)
             try:
@@ -1996,11 +2049,57 @@ async def webhook_message_read(request: Request):
 
 
 @app.post("/webhook/fanvue/new-follower")
-async def webhook_new_follower(request: Request):
+async def webhook_new_follower(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
     verify_signature(body, request.headers.get("X-Fanvue-Signature", ""))
     payload = json.loads(body)
-    logger.info("New follower: %s", payload.get("followerUuid", "unknown"))
+
+    follower = payload.get("follower") or {}
+    platform_user_id: str = (
+        follower.get("uuid", "") or
+        payload.get("followerUuid", "") or
+        payload.get("userUuid", "")
+    )
+    username: str = follower.get("handle", "") or follower.get("username", "") or payload.get("username", "")
+    display_name: str = follower.get("displayName", username) or payload.get("displayName", username)
+
+    logger.info("New follower: %s (@%s)", platform_user_id[:8] if platform_user_id else "unknown", username)
+
+    if not platform_user_id:
+        return JSONResponse({"status": "ignored"})
+
+    ctx = _get_model_context(payload)
+    model_id = ctx.model_id
+    creator_uuid = ctx.creator_uuid
+
+    async def handle():
+        try:
+            # Load existing record — follower may have been a subscriber before
+            existing = load_subscriber(PLATFORM, platform_user_id, model_id)
+            if existing is not None:
+                # Already know this person — they were a subscriber or we already DMed them
+                logger.info(">>> FOLLOWER already known (%s) — skipping nudge", platform_user_id[:8])
+                return
+
+            # Create a follower-only record to prevent double-messaging
+            sub = create_subscriber(
+                PLATFORM, platform_user_id, model_id,
+                username=username, display_name=display_name,
+            )
+            sub.is_follower_only = True
+
+            avatar = get_avatar(_avatars, sub.persona_id or ctx.default_avatar)
+            actions = await orchestrator_process_new_follower(
+                sub, avatar, model_profile=ctx.model_profile,
+                active_tier_count=ctx.active_tier_count,
+            )
+            save_subscriber(sub, PLATFORM, platform_user_id, model_id)
+            await execute_actions(actions, platform_user_id, model_id, sub, creator_uuid=creator_uuid)
+
+        except Exception as exc:
+            logger.exception("Error handling new follower %s: %s", platform_user_id, exc)
+
+    background_tasks.add_task(handle)
     return JSONResponse({"status": "ok"})
 
 

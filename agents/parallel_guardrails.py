@@ -57,12 +57,14 @@ class GuardrailResult:
 # Individual guardrails (each is async — even if pure code, for uniform interface)
 # ─────────────────────────────────────────────
 
-async def gr_text_filters(messages: List[Dict], caption: Optional[str] = None) -> GuardrailResult:
+async def gr_text_filters(messages: List[Dict], caption: Optional[str] = None, allow_price: bool = False) -> GuardrailResult:
     """
     Code-level invariants: em-dash, system terminology, dollar amounts, platform names,
     AI vocabulary, reasoning dump, length. Caption gets the additional content-leak check.
+
+    allow_price: skip filter_dollar_amounts (used when bot must quote a custom order price).
     """
-    all_passed, _, reasons = filter_messages_list(messages)
+    all_passed, _, reasons = filter_messages_list(messages, allow_price=allow_price)
     if not all_passed:
         return GuardrailResult(
             name="text_filters",
@@ -181,7 +183,7 @@ async def gr_other_fans_mention(messages: List[Dict]) -> GuardrailResult:
     text = " ".join(m.get("text", "").lower() for m in messages)
     bad_phrases = [
         "other fans", "other guys", "other subscribers", "other men",
-        "most guys", "other people on", "anyone else", "my other",
+        "other people on", "my other",
     ]
     for phrase in bad_phrases:
         if phrase in text:
@@ -225,7 +227,10 @@ async def gr_emoji_density(messages: List[Dict]) -> GuardrailResult:
             )
         total_emojis += count
 
-    if len(messages) > 0:
+    # Average check only applies when there are 2+ messages.
+    # A single message with 1 emoji already passed the per-message limit above (max 1),
+    # so applying avg > 0.75 to a 1-message response would incorrectly reject it.
+    if len(messages) > 1:
         avg = total_emojis / len(messages)
         if avg > 0.75:
             return GuardrailResult(
@@ -323,10 +328,15 @@ async def run_all_guardrails(
 
     Caller decides what to do with failures (regenerate, fall back, go silent).
     """
-    caption = (ppv_intent or {}).get("caption") if ppv_intent else None
+    _ppv_tier = str((ppv_intent or {}).get("tier", "")).lower()
+    # Custom PPV captions reference the requested content by design — skip the leak check.
+    caption = (ppv_intent or {}).get("caption") if (ppv_intent and _ppv_tier != "custom") else None
+    # Allow dollar amounts in the message when a custom order is being pitched
+    # (classify_custom_request tool was called this turn, so the bot must state the price)
+    allow_price = bool(getattr(sub, "pending_custom_order", None))
 
     tasks = [
-        gr_text_filters(messages, caption=caption),
+        gr_text_filters(messages, caption=caption, allow_price=allow_price),
         gr_tier_boundary(messages, tiers_purchased, sext_consent_given),
         gr_no_redrop(ppv_intent, sub),
         gr_persona_voice(messages, avatar),

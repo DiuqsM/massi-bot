@@ -14,7 +14,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_HAIKU_MODEL = "anthropic/claude-haiku-4-5-20251001"
+_HAIKU_MODEL = "anthropic/claude-haiku-4-5"
 
 _SYSTEM = """You extract fan profile data from a chat log between a content creator and a fan.
 

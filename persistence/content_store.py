@@ -118,12 +118,12 @@ def get_bundle_for_session_tier(
         .eq("model_id", model_id)
         .eq("session_number", session_number)
         .eq("tier", _tier_to_int(tier))
-        .single()
+        .limit(1)
         .execute()
     )
     if not result.data:
         return None
-    return _row_to_bundle_info(result.data)
+    return _row_to_bundle_info(result.data[0])
 
 
 def get_available_bundle(

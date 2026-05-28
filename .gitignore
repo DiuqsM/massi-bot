@@ -40,6 +40,14 @@ redis_data/
 
 # Session chat logs
 docs/sessions/
+docs/session/ 
+docs/agent_history/
+
+# Sim test results
+docs/test_results/
+docs/cicd_workflow.md
+docs/content_generation_list.txt
+docs/session/
 
 # AI session context (not for version control)
 AGENT.md

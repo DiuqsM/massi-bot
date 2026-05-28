@@ -12,7 +12,7 @@ he's a brokey — treat him like one. Tell him what you'd do to him
 but he needs to come back with money.
 """
 
-from typing import List, Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 import random
 
@@ -25,6 +25,58 @@ import random
 # Level 1: Subtle — "oh you don't have to baby"
 # Level 2: Medium — "I get it, not everyone can keep up"
 # Level 3: Direct — "I thought you were different"
+
+# For fans who have already purchased at least one tier — references their history.
+# No #1: warm nudge that calls back to what they already got
+# No #2: genuine disappointment that they'd stop now after already starting
+EGO_OBJECTIONS_RETURNING = {
+    1: {
+        "too_expensive": [
+            "babe… you already opened the last one and you know exactly what you got 😩 this is more of that",
+            "come on, you've seen what I do… you know it's worth it 😏 don't stop now",
+            "after what you already unlocked you're gonna hesitate on this one? 🥺 you know what's coming",
+        ],
+        "wants_cheaper": [
+            "I didn't lower it last time and you still came back 😏 that should tell you something",
+            "babe my prices haven't changed and you already know why 😩 it's the same quality you got before",
+        ],
+        "maybe_later": [
+            "you said that before and then you couldn't wait 😂 we both know how this goes",
+            "later always turns into right now with you 😏 don't fight it",
+        ],
+        "spent_too_much": [
+            "I hear you 🥺 take your time. but you know what's in here and you know you want it",
+            "no rush at all baby… but you've already seen what I deliver. this one's the same 💕",
+        ],
+        "wants_free": [
+            "you know I don't do free babe 😏 and you're still here, which means you know it's worth it",
+            "you already paid once and loved it… this is the same deal 😩 you know what you're getting",
+        ],
+    },
+    2: {
+        "too_expensive": [
+            "I'm honestly a little hurt 😩 you've already seen what I put into this and now you're stopping here?",
+            "you came this far and you're gonna stop now 🥺 that one's gonna sting later when you think about it",
+            "after everything we've already shared… okay. I'll be here if you change your mind 😕",
+        ],
+        "wants_cheaper": [
+            "I can't do that and honestly after last time I didn't think you'd ask 😕 it's the same value, same me",
+            "same price as always babe. you already know what that gets you 😩 I wish I could make it easier",
+        ],
+        "maybe_later": [
+            "okay 🥺 I just thought after last time you'd want to keep going… but I'll be here",
+            "you've been saying later more than you used to 😕 I hope it actually comes this time",
+        ],
+        "spent_too_much": [
+            "I respect that completely 💕 you've already been generous. come back whenever you're ready, no pressure",
+            "take care of yourself first 🥺 you already showed up for me once and that means a lot",
+        ],
+        "wants_free": [
+            "babe after everything… 😩 I just can't. but I really do want you to have this",
+            "you know what you're getting and you know it's worth it 😕 I can't go free but I wish I could",
+        ],
+    },
+}
 
 EGO_OBJECTIONS = {
     # ─── NO #1: Subtle ego bruise (plant the seed) ───
@@ -55,29 +107,28 @@ EGO_OBJECTIONS = {
         ],
     },
 
-    # ─── NO #2: Medium ego bruise (challenge his manhood) ───
+    # ─── NO #2: Genuine disappointment + FOMO (no condescension) ───
     2: {
         "too_expensive": [
-            "I mean… it's really not that much babe 😅 like most of my guys don't even think twice about it",
-            "okay I'm not gonna lie that kind of stings 😩 I thought I was worth it to you but I guess not everyone sees it the same way",
-            "hmm okay… I just didn't expect YOU to be the one to say that. you seemed different from the other guys in here 😏",
-            "I get it I get it… it's just that the guys who DO get it? they get a LOT more of my attention afterwards 🤷‍♀️💕",
+            "honestly that's a little disappointing to hear… I had something really good saved for you specifically 😩 but I get it, timing is timing",
+            "I'm not gonna lie I was genuinely excited to show you this one 😩 but if it's not the right time it's not the right time. I'll be here",
+            "okay… I won't push. I just thought we were building to something and I was really looking forward to sharing it with you 🥺",
         ],
         "wants_cheaper": [
-            "babe I've literally never lowered my prices for anyone 😅 and some of these guys spend way more than this without blinking",
-            "you want me to lower it? 😂 baby the last guy that was here tipped me more than this costs. I'm not trying to be mean but… 🤷‍♀️",
+            "I wish I could babe but my prices are what they are 😕 I put real effort into this stuff and I stand by it. no hard feelings",
+            "I can't do that but I genuinely want you to have this 😩 it's not about squeezing you, it's just what it's worth to me",
         ],
         "maybe_later": [
-            "you keep saying later but like… other guys are messaging me right now who don't say later 😅 I'm just being honest",
-            "okay babe but just so you know I'm talking to other guys who actually want this right now 🤷‍♀️ no pressure though",
+            "okay… I hope later actually comes 🥺 I don't want to keep this waiting forever you know",
+            "I'll hold onto it for you 😕 just don't wait too long… I hate the idea of you missing this",
         ],
         "spent_too_much": [
-            "babe you've spent less than most of my regulars spend in a week 😅 I'm not trying to be rude but like… perspective?",
-            "I hear you but honestly? the guys I really vibe with don't keep track like that 😏 they just enjoy the ride",
+            "I hear you and I respect that completely 🥺 take care of yourself first. I'll still be here when the timing's better",
+            "no pressure at all, seriously. you've already shown up for me and that means something 💕 just come back when you're ready",
         ],
         "wants_free": [
-            "baby the guys who ask for free content are the same ones I stop responding to eventually 😅 just being real with you",
-            "free? 😂 babe I have guys literally begging to pay for this. you're cute but not THAT cute 😏",
+            "I can't do free babe, I just can't 😕 but I really do want you to see this… it's not about the money it's about the experience",
+            "I wish I could just give you everything 😩 but I gotta keep it real with you. it's worth it I promise",
         ],
     },
 
@@ -303,7 +354,7 @@ class SessionController:
     """
 
     SESSION_COOLDOWN_HOURS = 6  # Minimum hours between full sessions
-    MAX_OBJECTIONS = 3          # 3-No Rule
+    MAX_OBJECTIONS = 2          # 2-No Rule
     BROKEY_COOLING_DAYS = 5     # Days of warmth-only after brokey_flagged=True (U4)
     
     @staticmethod
@@ -326,17 +377,17 @@ class SessionController:
         objection_type: str,
     ) -> Tuple[str, str]:
         """
-        Handle a tier objection using the 3-No ego escalation.
-        
+        Handle a tier objection using the 2-No ego escalation.
+        Uses returning-buyer templates when fan has already purchased at least one tier.
+
         Returns: (response_message, next_action)
-            next_action: "retry" | "brokey" | "continue"
+            next_action: "retry" | "brokey"
         """
         sub.tier_no_count += 1
         sub.spending.price_objection_count += 1
-        
-        no_level = min(sub.tier_no_count, 3)
-        
-        # Map objection types to template keys
+
+        no_level = min(sub.tier_no_count, 2)
+
         obj_key_map = {
             "TOO_EXPENSIVE": "too_expensive",
             "WANTS_CHEAPER": "wants_cheaper",
@@ -345,19 +396,19 @@ class SessionController:
             "WANTS_FREE": "wants_free",
         }
         key = obj_key_map.get(objection_type, "too_expensive")
-        
-        # Get templates for this level + objection type
-        level_templates = EGO_OBJECTIONS.get(no_level, EGO_OBJECTIONS[1])
+
+        # Returning buyers (already purchased) get templates that reference history
+        ppv_count = (sub.spending.ppv_count if sub.spending else 0)
+        pool = EGO_OBJECTIONS_RETURNING if ppv_count > 0 else EGO_OBJECTIONS
+        level_templates = pool.get(no_level, pool[1])
         templates = level_templates.get(key, level_templates["too_expensive"])
-        
+
         msg = random.choice(templates)
-        
-        if no_level >= 3:
-            # 3rd No — brokey treatment
+
+        if no_level >= 2:
             sub.brokey_flagged = True
             return msg, "brokey"
-        else:
-            return msg, "retry"
+        return msg, "retry"
     
     @staticmethod
     def get_brokey_response(sub, avatar_config) -> List[str]:
@@ -463,3 +514,65 @@ class SessionController:
         
         templates = pool_map.get(context, GFE_FLIRTY_BANTER)
         return random.choice(templates)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 7. OBJECTION KEYWORD CLASSIFIER
+# ═══════════════════════════════════════════════════════════════
+
+_OBJECTION_PATTERNS: Dict[str, List[str]] = {
+    "TOO_EXPENSIVE": [
+        "too expensive", "too much", "that's a lot", "that's too much", "costs too much",
+        "way too much", "thats alot", "thats too much", "too pricey", "too costly",
+        "can't afford", "cant afford", "don't have that", "dont have that",
+        "broke", "no money", "don't have money", "dont have money", "low on cash",
+        "tight rn", "tight right now", "funds are low",
+        "too rich", "that's steep", "thats steep", "way too expensive", "nah that's",
+        "no way that's", "no way thats",
+        "can't swing it", "cant swing it", "can't swing that", "cant swing that",
+        "can't do that", "cant do that price", "out of my budget", "not in my budget",
+    ],
+    "WANTS_CHEAPER": [
+        "cheaper", "discount", "lower the price", "lower price", "reduce the price",
+        "for less than that", "hook me up with a deal", "can i get it for less",
+        "negotiate the price", "any deals", "any discount",
+    ],
+    "MAYBE_LATER": [
+        "maybe later", "next time", "not right now", "not now",
+        "some other time", "another time", "not today", "not tonight",
+        "maybe next time", "i'll think about it", "let me think about it", "ill think about it",
+        "not yet", "maybe another time", "pass for now", "skip for now",
+        "not interested", "no thanks", "nah thanks", "i'll pass", "ill pass",
+        "pass on that", "still no", "i said no", "still not feeling", "changed my mind",
+        "i'm good", "im good", "all good thanks",
+        "not in the market", "not the right time", "not happening", "gonna pass",
+        "just gonna pass", "imma pass", "hard pass", "gonna have to pass",
+        "not for me", "not my thing", "nah i'm good", "nah im good",
+        "nah i'm alright", "nah im alright", "i'm alright", "im alright",
+    ],
+    "SPENT_TOO_MUCH": [
+        "already spent", "spent enough", "spent too much", "spent a lot",
+        "spent alot", "i've been spending", "ive been spending",
+        "running low", "almost out", "getting low",
+    ],
+    "WANTS_FREE": [
+        "for free", "free content", "send it free", "free pic", "free vid",
+        "without paying", "without pay", "no charge", "don't charge",
+        "dont charge", "just send", "just give",
+    ],
+}
+
+
+def classify_objection(message: str) -> Optional[str]:
+    """
+    Detect if a fan message is a price objection. Returns the objection
+    type string (e.g. 'TOO_EXPENSIVE') or None if no objection detected.
+    Only fires when a PPV is pending or sext_consent is active — the
+    caller is responsible for that context check.
+    """
+    msg = message.lower().strip()
+    for obj_type, patterns in _OBJECTION_PATTERNS.items():
+        for p in patterns:
+            if p in msg:
+                return obj_type
+    return None

@@ -235,6 +235,7 @@ class Subscriber:
     source_ig_account: str = ""         # Which IG account they came from
     source_detected: bool = False
     subscribe_date: datetime = field(default_factory=datetime.now)
+    is_follower_only: bool = False       # True until they pay for a subscription
 
     # Qualifying data
     qualifying: QualifyingData = field(default_factory=QualifyingData)
@@ -272,6 +273,7 @@ class Subscriber:
     tier_no_count: int = 0                    # Objections to current tier (resets on purchase)
     last_session_completed_at: Optional[datetime] = None  # When last full session ended
     session_locked_until: Optional[datetime] = None       # No new sessions before this time
+    session_lock_push_count: int = 0           # How many times fan pushed during lock (escalates DESIRE→BOUNDARY→FIRM)
     custom_declined: bool = False             # Declined the custom pitch this session
     brokey_flagged: bool = False              # Hit 3 nos, got the brokey treatment
     last_pitch_at: Optional[datetime] = None  # Last time a PPV was pitched (same-day dedup)
@@ -282,6 +284,7 @@ class Subscriber:
     sext_consent_given: bool = False         # Legacy flag — kept for backwards compat; gate now uses horniness_score
     horniness_score: int = 0                 # 0-10, updated every message by Opus. Grok kicks in at > 5.
     fan_name: str = ""                       # Preferred name/nickname extracted by agent ("Jake", "daddy", etc.)
+    fan_name_last_used_at_msg: int = 0       # message_count when bot last said his name (rate-limit enforcement)
     fan_profile: Dict[str, Any] = field(default_factory=lambda: {
         "personality": "",   # how he communicates and behaves (e.g. "shy but bold when comfortable")
         "interests": [],     # hobbies and topics he brings up

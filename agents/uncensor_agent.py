@@ -19,14 +19,13 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "x-ai/grok-4.1-fast"
+_MODEL = "x-ai/grok-4.3"
 _TIMEOUT = 15.0
 _MAX_TOKENS = 200
 
 # Fallback models for Grok rate limits
 _FALLBACKS = [
-    "x-ai/grok-4.1-fast",
-    "x-ai/grok-4-fast",
+    "x-ai/grok-4.20",
     "nousresearch/hermes-4-70b",
 ]
 

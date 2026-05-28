@@ -79,7 +79,7 @@ _REASONING_MARKERS = [
     r"^considering\s",
     r"^step\s*\d+\s*[:.]",
     r"^\*\*",                      # bold-marker reasoning ("**Key insight:**")
-    r"^#\s",                       # markdown header
+    r"^#{1,6}\s",                  # markdown header (# through ######)
     r"^okay so let me\s",
     r"^so first\s",
     r"^the key issue\b",
@@ -257,7 +257,7 @@ _REJECT_FILTERS = [
 ]
 
 
-def run_message_filters(text: str) -> Tuple[bool, str, List[str]]:
+def run_message_filters(text: str, allow_price: bool = False) -> Tuple[bool, str, List[str]]:
     """
     Run all message-level filters on a user-facing text.
 
@@ -266,6 +266,9 @@ def run_message_filters(text: str) -> Tuple[bool, str, List[str]]:
         - passed=True if no rejections (auto-fix filters always pass)
         - cleaned_text is the text after all auto-fixes
         - rejection_reasons is a list of reasons if passed=False (one per failing reject filter)
+
+    allow_price: when True, skip filter_dollar_amounts (used for custom order quotes where
+    the bot must state the price explicitly).
     """
     cleaned = text
     reasons: List[str] = []
@@ -276,6 +279,8 @@ def run_message_filters(text: str) -> Tuple[bool, str, List[str]]:
 
     # Reject filters
     for fn in _REJECT_FILTERS:
+        if allow_price and fn is filter_dollar_amounts:
+            continue
         ok, cleaned, reason = fn(cleaned)
         if not ok and reason:
             reasons.append(reason)
@@ -304,19 +309,19 @@ def run_caption_filters(caption: str) -> Tuple[bool, str, List[str]]:
     return (len(reasons) == 0, cleaned, reasons)
 
 
-def filter_message_dict(msg: Dict) -> Tuple[bool, Dict, List[str]]:
+def filter_message_dict(msg: Dict, allow_price: bool = False) -> Tuple[bool, Dict, List[str]]:
     """
     Filter a message dict {"text": str, "delay_seconds": int}.
     Returns (passed, cleaned_msg_dict, rejection_reasons).
     """
     text = msg.get("text", "")
-    passed, cleaned, reasons = run_message_filters(text)
+    passed, cleaned, reasons = run_message_filters(text, allow_price=allow_price)
     new_msg = dict(msg)
     new_msg["text"] = cleaned
     return passed, new_msg, reasons
 
 
-def filter_messages_list(messages: List[Dict]) -> Tuple[bool, List[Dict], List[str]]:
+def filter_messages_list(messages: List[Dict], allow_price: bool = False) -> Tuple[bool, List[Dict], List[str]]:
     """
     Filter a list of message dicts. Returns (all_passed, cleaned_list, all_reasons).
     A failure on ANY message means the whole batch needs regeneration.
@@ -325,7 +330,7 @@ def filter_messages_list(messages: List[Dict]) -> Tuple[bool, List[Dict], List[s
     all_reasons: List[str] = []
     all_passed = True
     for msg in messages:
-        passed, cleaned, reasons = filter_message_dict(msg)
+        passed, cleaned, reasons = filter_message_dict(msg, allow_price=allow_price)
         cleaned_list.append(cleaned)
         if not passed:
             all_passed = False
