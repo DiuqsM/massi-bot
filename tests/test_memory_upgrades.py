@@ -123,8 +123,8 @@ class TestMemoryDedup:
         mock_sb.rpc.assert_called_once_with("match_subscriber_memory", {
             "p_sub_id": "test-sub",
             "p_query_emb": [0.1] * 384,
-            "p_limit": 1,
-            "p_threshold": 0.85,
+            "p_limit": 3,
+            "p_threshold": 0.60,
         })
         # Should have updated last_accessed, NOT inserted
         mock_sb.table.return_value.update.assert_called_once()
